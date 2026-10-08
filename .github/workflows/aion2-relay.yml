@@ -20,6 +20,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Latest branch state, not the commit from when this run was triggered. A run queued
+          # behind another would otherwise load stale aion2_seen.json and repost its tweets.
+          ref: ${{ github.ref }}
 
       - uses: actions/setup-python@v5
         with:
