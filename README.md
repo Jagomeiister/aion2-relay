@@ -1,6 +1,6 @@
 # aion2-relay
 
-Checks the official AION 2 X account (via an RSS feed) every 10 minutes and posts
+Checks the official AION 2 X account (via an RSS feed) every 15 minutes and posts
 maintenance, event and update tweets to Discord, with times converted to Brisbane
 and New Zealand time. Runs on GitHub Actions.
 

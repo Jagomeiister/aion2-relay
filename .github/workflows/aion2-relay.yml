@@ -2,9 +2,9 @@ name: AION 2 maintenance relay
 
 on:
   schedule:
-    # Every 10 min at :04, :14, :24... (off the top of the hour, when GitHub's
-    # scheduler is busiest and most likely to delay or drop runs).
-    - cron: "4-59/10 * * * *"
+    # Every 15 min on the quarter hour (:00, :15, :30, :45). GitHub's scheduler is
+    # busiest at the start of each hour, so the :00 run is the likeliest to be late.
+    - cron: "0,15,30,45 * * * *"
   workflow_dispatch:          # lets you trigger it manually from the Actions tab
 
 permissions:
