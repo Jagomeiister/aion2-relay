@@ -332,3 +332,14 @@ def test_cancelled_maintenance_gets_its_own_title_and_no_ping(text, monkeypatch)
 def test_post_shows_source_account(link, author):
     p = r.build_payload(r.classify("Patch notes"), {"link": link}, "Patch notes", "KST", [], "src feed")
     assert p["embeds"][0]["author"]["name"] == author
+
+
+def test_times_are_12_hour():
+    _, ts = r.parse_times("メンテナンス 10月8日 19:45 ~ 00:30 JST", PUB)
+    out = r.format_times("JST", ts)
+    assert "**Thu 8 Oct 7:45 pm JST**" in out
+    assert "Brisbane: Thu 8 Oct 8:45 pm AEST" in out
+    assert "New Zealand: Thu 8 Oct 11:45 pm NZDT" in out
+    assert "Brisbane: Fri 9 Oct 1:30 am AEST" in out  # 00:30 JST next day
+    assert "**Fri 9 Oct 12:30 am JST**" in out  # midnight hour is 12, not 0
+    assert "19:45" not in out and "20:45" not in out

@@ -173,13 +173,18 @@ def parse_times(text: str, published: datetime | None):
     return tz_label, results
 
 
+def fmt_12h(dt) -> str:
+    """e.g. "Thu 8 Oct 7:45 pm" (built by hand: %-I isn't portable)."""
+    return f"{dt:%a} {dt.day} {dt:%b} {dt.hour % 12 or 12}:{dt.minute:02d} {'am' if dt.hour < 12 else 'pm'}"
+
+
 def format_times(tz_label, times):
     lines = []
     for dt in times:
-        parts = [f"**{dt:%a %d %b %H:%M} {tz_label}**"]
+        parts = [f"**{fmt_12h(dt)} {tz_label}**"]
         for name, tz in TARGETS:
             local = dt.astimezone(tz)
-            parts.append(f"{name}: {local:%a %d %b %H:%M} {local:%Z}")
+            parts.append(f"{name}: {fmt_12h(local)} {local:%Z}")
         parts.append(f"Your time: <t:{int(dt.timestamp())}:F>")
         lines.append(" → ".join(parts[:1]) + "\n" + "\n".join("• " + p for p in parts[1:]))
     return "\n\n".join(lines)
