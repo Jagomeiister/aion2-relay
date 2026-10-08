@@ -145,31 +145,55 @@ def find_date(text: str, ref: date) -> date | None:
     return None
 
 
-def parse_times(text: str, published: datetime | None):
-    """Return (tz_label, [aware datetimes]) for times found in the post."""
+# What may sit between two times for them to count as one range: "19:45-20:45", "10:00 ~ 14:00",
+# "10 am to 2 pm", "10:00から14:00", "10:00부터 14:00".
+RANGE_GAP_RE = re.compile(r"\s*(?:-|–|—|~|～|〜|to|until|till|から|부터)\s*", re.I)
+
+
+def parse_times(text: str, published: datetime | None, default_tz: str | None = None):
+    """Return (tz_label, [(start, end or None)]) for times found in the post, repeats removed."""
     m = TZ_RE.search(text)
     if m and m.group(1):  # explicit offset, e.g. "(UTC+9)"
         offset = timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0))
         tz_label = f"UTC{m.group(1)}{int(m.group(2))}" + (f":{m.group(3)}" if m.group(3) else "")
         src = timezone(offset if m.group(1) == "+" else -offset, tz_label)
     else:
-        tz_label = m.group(4).upper() if m else SOURCE_TZ
+        tz_label = m.group(4).upper() if m else (default_tz or SOURCE_TZ)
         src = ZoneInfo(TZ_ALIASES.get(tz_label, "Asia/Seoul"))
 
     ref = (published or datetime.now(src)).astimezone(src)
     d = find_date(text, ref.date()) or ref.date()
     base = datetime(d.year, d.month, d.day, tzinfo=src)
 
-    results, prev = [], None
-    for hh, mm, ampm in TIME_RE.findall(TZ_RE.sub(" ", text)):  # drop "+09:00" offsets first
+    plain = TZ_RE.sub(lambda t: " " * len(t.group()), text)  # blank "+09:00" offsets, keep positions
+    found = []  # (match, datetime)
+    for t in TIME_RE.finditer(plain):
+        hh, mm, ampm = t.groups()
         h = int(hh)
         if ampm:
             h = h % 12 + (12 if ampm.lower() == "p" else 0)
-        dt = base + timedelta(hours=h, minutes=int(mm))
-        if prev and dt < prev:          # e.g. 22:00 ~ 02:00 rolls past midnight
-            dt += timedelta(days=1)
-        results.append(dt)
-        prev = dt
+        found.append((t, base + timedelta(hours=h, minutes=int(mm))))
+
+    ranges, i = [], 0
+    while i < len(found):
+        (m1, start), nxt = found[i], found[i + 1] if i + 1 < len(found) else None
+        if nxt and RANGE_GAP_RE.fullmatch(plain[m1.end():nxt[0].start()]):
+            end = nxt[1]
+            if end <= start:  # e.g. 22:00 ~ 02:00 rolls past midnight
+                end += timedelta(days=1)
+            ranges.append((start, end))
+            i += 2
+        else:
+            ranges.append((start, None))
+            i += 1
+
+    # Quoted/repeated tweets mention the same time again: drop exact repeats, and a lone
+    # time that is just the start of a range already listed ("19:45" + "19:45-20:45").
+    range_starts = {s for s, e in ranges if e}
+    results = []
+    for s, e in ranges:
+        if (s, e) not in results and not (e is None and s in range_starts):
+            results.append((s, e))
     return tz_label, results
 
 
@@ -178,14 +202,30 @@ def fmt_12h(dt) -> str:
     return f"{dt:%a} {dt.day} {dt:%b} {dt.hour % 12 or 12}:{dt.minute:02d} {'am' if dt.hour < 12 else 'pm'}"
 
 
+def fmt_span(start, end) -> str:
+    """ "Thu 8 Oct 7:45 pm", or a range: "Thu 8 Oct 7:45 – 8:45 pm" / "... 11:45 pm – Fri 9 Oct 12:45 am"."""
+    if end is None:
+        return fmt_12h(start)
+    if end.date() != start.date():
+        return f"{fmt_12h(start)} – {fmt_12h(end)}"
+    s, e = fmt_12h(start), fmt_12h(end).split(" ", 3)[3]  # end: clock part only
+    if s[-2:] == e[-2:]:
+        s = s[:-3]  # same am/pm: "7:45 – 8:45 pm"
+    return f"{s} – {e}"
+
+
 def format_times(tz_label, times):
     lines = []
-    for dt in times:
-        parts = [f"**{fmt_12h(dt)} {tz_label}**"]
+    for start, end in times:
+        parts = [f"**{fmt_span(start, end)} {tz_label}**"]
         for name, tz in TARGETS:
-            local = dt.astimezone(tz)
-            parts.append(f"{name}: {fmt_12h(local)} {local:%Z}")
-        parts.append(f"Your time: <t:{int(dt.timestamp())}:F>")
+            ls, le = start.astimezone(tz), end.astimezone(tz) if end else None
+            parts.append(f"{name}: {fmt_span(ls, le)} {ls:%Z}")
+        yours = f"<t:{int(start.timestamp())}:F>"
+        if end:  # Discord renders these in each reader's own zone and clock format
+            same_day = end - start < timedelta(hours=12)
+            yours += f" – <t:{int(end.timestamp())}:{'t' if same_day else 'F'}>"
+        parts.append(f"Your time: {yours}")
         lines.append(" → ".join(parts[:1]) + "\n" + "\n".join("• " + p for p in parts[1:]))
     return "\n\n".join(lines)
 
@@ -222,7 +262,7 @@ def window_key(cat, times, text=""):
     """Maintenance with the same start time = same maintenance (catches reminder tweets)."""
     if cat["key"] != "maintenance" or not times or CANCEL_RE.search(text):
         return None  # a cancellation shares the start time but is news, not a reminder
-    return f"maint:{times[0].astimezone(ZoneInfo('UTC')):%Y%m%d%H%M}"
+    return f"maint:{times[0][0].astimezone(ZoneInfo('UTC')):%Y%m%d%H%M}"
 
 
 def load_state():
@@ -374,7 +414,10 @@ def main():
             continue
 
         try:
-            tz_label, times = parse_times(text, published)
+            # Tweets rarely name their zone; label Japanese-account times JST (same UTC+9 as KST).
+            handle = HANDLE_RE.search(entry.get("link") or "")
+            default_tz = "JST" if handle and handle.group(1).upper().endswith("_JP") else None
+            tz_label, times = parse_times(text, published, default_tz)
         except Exception as e:  # odd date text must never block the post itself
             print(f"time parse failed {eid}: {type(e).__name__}: {e}")
             tz_label, times = SOURCE_TZ, []

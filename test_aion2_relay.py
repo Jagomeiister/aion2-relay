@@ -20,10 +20,16 @@ def hm(dt, tz="Asia/Seoul"):
     return dt.astimezone(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M")
 
 
+def parse_flat(text, published):
+    """parse_times() as a flat list of datetimes (range starts and ends in order)."""
+    tz, ranges = r.parse_times(text, published)
+    return tz, [t for s, e in ranges for t in (s, e) if t]
+
+
 # --- time parsing ---------------------------------------------------------
 
 def test_basic_kst_range_and_targets():
-    tz, ts = r.parse_times("Maintenance 10/9 10:00 ~ 14:00 (KST)", PUB)
+    tz, ts = parse_flat("Maintenance 10/9 10:00 ~ 14:00 (KST)", PUB)
     assert tz == "KST"
     assert [hm(t) for t in ts] == ["2026-10-09 10:00", "2026-10-09 14:00"]
     assert hm(ts[0], "Australia/Brisbane") == "2026-10-09 11:00"
@@ -36,26 +42,26 @@ def test_basic_kst_range_and_targets():
     "Version 1.5.2 maintenance 10:00",
 ])
 def test_version_numbers_do_not_crash(text):
-    _, ts = r.parse_times(text, PUB)
+    _, ts = parse_flat(text, PUB)
     assert len(ts) == 1
 
 
 def test_utc_offset_is_not_plain_utc():
-    tz, ts = r.parse_times("Maintenance 10/9 10:00 (UTC+9)", PUB)
+    tz, ts = parse_flat("Maintenance 10/9 10:00 (UTC+9)", PUB)
     assert tz == "UTC+9"
     assert hm(ts[0]) == "2026-10-09 10:00"
     assert len(ts) == 1  # the "+09" must not be read as a time
 
 
 def test_korean_and_japanese_suffixes():
-    _, ts = r.parse_times("10월 9일 10:00부터 14:00까지 점검", PUB)
+    _, ts = parse_flat("10월 9일 10:00부터 14:00까지 점검", PUB)
     assert [hm(t) for t in ts] == ["2026-10-09 10:00", "2026-10-09 14:00"]
-    _, ts = r.parse_times("10月9日 10:00から14:00までメンテナンス", PUB)
+    _, ts = parse_flat("10月9日 10:00から14:00までメンテナンス", PUB)
     assert [hm(t) for t in ts] == ["2026-10-09 10:00", "2026-10-09 14:00"]
 
 
 def test_year_rollover():
-    _, ts = r.parse_times("Maintenance 1/5 10:00 KST", datetime(2026, 12, 28, tzinfo=UTC))
+    _, ts = parse_flat("Maintenance 1/5 10:00 KST", datetime(2026, 12, 28, tzinfo=UTC))
     assert hm(ts[0]) == "2027-01-05 10:00"
 
 
@@ -65,17 +71,17 @@ def test_year_rollover():
     "Maintenance on 15 Oct 10:00 KST",
 ])
 def test_english_month_names(text):
-    _, ts = r.parse_times(text, PUB)
+    _, ts = parse_flat(text, PUB)
     assert hm(ts[0]) == "2026-10-15 10:00"
 
 
 def test_am_pm():
-    _, ts = r.parse_times("Maintenance Oct 9 10:00 AM - 2:00 PM PDT", PUB)
+    _, ts = parse_flat("Maintenance Oct 9 10:00 AM - 2:00 PM PDT", PUB)
     assert [hm(t, "America/Los_Angeles") for t in ts] == ["2026-10-09 10:00", "2026-10-09 14:00"]
 
 
 def test_overnight_rolls_to_next_day():
-    _, ts = r.parse_times("Maintenance 10/9 22:00 ~ 02:00 KST", PUB)
+    _, ts = parse_flat("Maintenance 10/9 22:00 ~ 02:00 KST", PUB)
     assert [hm(t) for t in ts] == ["2026-10-09 22:00", "2026-10-10 02:00"]
 
 
@@ -337,9 +343,40 @@ def test_post_shows_source_account(link, author):
 def test_times_are_12_hour():
     _, ts = r.parse_times("メンテナンス 10月8日 19:45 ~ 00:30 JST", PUB)
     out = r.format_times("JST", ts)
-    assert "**Thu 8 Oct 7:45 pm JST**" in out
-    assert "Brisbane: Thu 8 Oct 8:45 pm AEST" in out
-    assert "New Zealand: Thu 8 Oct 11:45 pm NZDT" in out
-    assert "Brisbane: Fri 9 Oct 1:30 am AEST" in out  # 00:30 JST next day
-    assert "**Fri 9 Oct 12:30 am JST**" in out  # midnight hour is 12, not 0
+    # Overnight range: end shows its own date; midnight hour is 12, not 0.
+    assert "**Thu 8 Oct 7:45 pm – Fri 9 Oct 12:30 am JST**" in out
+    assert "Brisbane: Thu 8 Oct 8:45 pm – Fri 9 Oct 1:30 am AEST" in out
+    assert "New Zealand: Thu 8 Oct 11:45 pm – Fri 9 Oct 4:30 am NZDT" in out
     assert "19:45" not in out and "20:45" not in out
+
+
+SCREENSHOT_TEXT = """Notice of temporary maintenance cancellation
+We have decided to cancel the maintenance scheduled for today, October 8th (Thursday) 19:45.
+#AION2 #Aion2AION2 (@AION2_JP) [Notice of temporary maintenance on October 8th (Thursday)]
+Implementation date and time
+Thursday, October 8th 19:45-20:45 (1 hour 00 minutes)"""
+
+
+def test_quoted_repeat_collapses_to_one_range():
+    tz, ts = r.parse_times(SCREENSHOT_TEXT, PUB, "JST")
+    assert tz == "JST"
+    assert [(hm(s), hm(e)) for s, e in ts] == [("2026-10-08 19:45", "2026-10-08 20:45")]
+    out = r.format_times(tz, ts)
+    assert out.count("Brisbane") == 1
+    assert "**Thu 8 Oct 7:45 – 8:45 pm JST**" in out
+    assert "Brisbane: Thu 8 Oct 8:45 – 9:45 pm AEST" in out
+    assert "New Zealand: Thu 8 Oct 11:45 pm – Fri 9 Oct 12:45 am NZDT" in out
+    assert "Your time: <t:" in out and "> – <t:" in out and ":t>" in out
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Maint 10:00 am to 2:00 pm KST", "10:00 am – 2:00 pm"),
+    ("Maint 9:00 ~ 11:30 KST", "9:00 – 11:30 am"),
+    ("Maint 10:00, servers open 14:00 KST", None),  # comma: two separate times
+])
+def test_range_detection(text, expected):
+    _, ts = r.parse_times(text, PUB)
+    if expected:
+        assert len(ts) == 1 and expected in r.format_times("KST", ts)
+    else:
+        assert [e for s, e in ts] == [None, None]
