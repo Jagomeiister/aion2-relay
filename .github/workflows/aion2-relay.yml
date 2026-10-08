@@ -1,0 +1,49 @@
+name: AION 2 maintenance relay
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 min (GitHub may run it a few minutes late)
+  workflow_dispatch:          # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write             # only needed to commit the seen-posts state file
+
+concurrency:
+  group: aion2-relay
+  cancel-in-progress: false   # never run two at once (avoids double posts)
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check feed and post to Discord
+        env:
+          FEED_URL: ${{ secrets.FEED_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}       # optional
+          CATEGORIES: maintenance,event,update                   # drop any you don't want
+          SOURCE_TZ: KST
+          STATE_FILE: aion2_seen.json
+        run: python aion2_maint_relay.py
+
+      - name: Save seen-posts state
+        if: success() || failure()  # also after a failed post, so successful ones aren't reposted
+        run: |
+          [ -f aion2_seen.json ] || { echo "No state file yet"; exit 0; }
+          git config user.name "aion2-relay-bot"
+          git config user.email "aion2-relay-bot@users.noreply.github.com"
+          git add aion2_seen.json
+          git diff --cached --quiet && { echo "No new posts"; exit 0; }
+          git commit -m "Update seen posts [skip ci]"
+          git pull --rebase -X theirs   # in case you edited aion2_seen.json mid-run
+          git push
