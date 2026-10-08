@@ -138,10 +138,20 @@ def harness(tmp_path, monkeypatch):
         sent.append(payload)
 
     monkeypatch.setattr(r, "post", fake_post)
-    # feedparser returns newest first
-    monkeypatch.setattr(r.feedparser, "parse", lambda url: SimpleNamespace(
-        entries=list(reversed(feed)), bozo=0, get=lambda k, d=None: 200))
-    return SimpleNamespace(state=state, sent=sent, feed=feed, fail=fail)
+    feeds = {FEED_A: feed}  # url -> entries (oldest first); missing url = feed down
+    monkeypatch.setattr(r, "FEED_URLS", [FEED_A])
+
+    def fake_parse(url):
+        entries = list(reversed(feeds.get(url, [])))  # feedparser returns newest first
+        return SimpleNamespace(entries=entries, bozo=0, feed={"title": f"src {url[-5:]}"},
+                               get=lambda k, d=None: 200 if entries else 404)
+
+    monkeypatch.setattr(r.feedparser, "parse", fake_parse)
+    return SimpleNamespace(state=state, sent=sent, feed=feed, fail=fail, feeds=feeds)
+
+
+FEED_A = "https://rss.app/feeds/AAAAsecretA.xml"
+FEED_B = "https://rss.app/feeds/BBBBsecretB.xml"
 
 
 def test_end_to_end(harness, capsys):
@@ -203,3 +213,68 @@ def test_role_ping_only_on_maintenance(monkeypatch):
     assert p["allowed_mentions"] == {"roles": ["987654321"]}  # no "parse" -> @everyone can't fire
     ev = r.build_payload(r.classify("New event!"), {"link": ""}, "New event!", "KST", [])
     assert "content" not in ev and ev["allowed_mentions"] == {"parse": []}
+
+
+# --- multiple feeds -------------------------------------------------------
+
+def test_feed_url_secret_splits_on_lines_and_commas(monkeypatch):
+    monkeypatch.setenv("FEED_URL", f"{FEED_A}\n  {FEED_B} ,\n")
+    import importlib
+    try:
+        assert importlib.reload(r).FEED_URLS == [FEED_A, FEED_B]
+    finally:
+        monkeypatch.delenv("FEED_URL")
+        os.environ["FEED_URL"] = "https://feed.example/x.xml"
+        importlib.reload(r)
+
+
+def test_new_feed_is_baselined_not_flooded(harness, monkeypatch):
+    h = harness
+    h.feed.append(entry(1, "hi"))
+    r.main()
+    # Second feed added later with an important backlog tweet: must not post it.
+    h.feeds[FEED_B] = [entry(10, "Maintenance 10/9 10:00 KST")]
+    monkeypatch.setattr(r, "FEED_URLS", [FEED_A, FEED_B])
+    r.main()
+    assert h.sent == []
+    # A new tweet on feed B after that does post, with feed B's name in the footer.
+    h.feeds[FEED_B].append(entry(11, "Login reward event!", 5))
+    r.main()
+    assert len(h.sent) == 1
+    assert h.sent[0]["embeds"][0]["footer"]["text"] == f"src {FEED_B[-5:]}"
+    # The state file is public: it must never contain the feed URLs.
+    assert "secret" not in h.state.read_text()
+
+
+def test_posts_are_sorted_by_date_across_feeds(harness, monkeypatch):
+    h = harness
+    h.feed.append(entry(1, "hi"))
+    h.feeds[FEED_B] = [entry(2, "hi", 1)]
+    monkeypatch.setattr(r, "FEED_URLS", [FEED_A, FEED_B])
+    r.main()
+    h.feed.append(entry(30, "Patch notes later", 30))
+    h.feeds[FEED_B].append(entry(20, "Maintenance earlier 10/9 10:00 KST", 20))
+    h.feed.append(entry(20, "Maintenance earlier 10/9 10:00 KST", 20))  # same tweet in both feeds
+    r.main()
+    assert [p["embeds"][0]["url"][-2:] for p in h.sent] == ["20", "30"]
+
+
+def test_one_feed_down_others_still_post(harness, monkeypatch):
+    h = harness
+    h.feeds[FEED_B] = [entry(2, "hi")]
+    h.feed.append(entry(1, "hi"))
+    monkeypatch.setattr(r, "FEED_URLS", [FEED_A, FEED_B])
+    r.main()
+    del h.feeds[FEED_B]
+    h.feed.append(entry(3, "Maintenance 10/9 10:00 KST", 3))
+    with pytest.raises(SystemExit):  # run shows red...
+        r.main()
+    assert len(h.sent) == 1  # ...but feed A still posted
+
+
+def test_old_state_without_feeds_is_not_rebaselined(harness):
+    h = harness
+    h.state.write_text(json.dumps({"ids": ["1"], "recent": {}}))  # pre-multi-feed state
+    h.feed += [entry(1, "hi"), entry(2, "Maintenance 10/9 10:00 KST", 1)]
+    r.main()
+    assert len(h.sent) == 1

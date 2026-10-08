@@ -9,7 +9,7 @@ Only important posts are relayed:
 Everything else (memes, retweets, replies, fan art shares...) is skipped.
 
 Env vars (GitHub Actions secrets, or a chmod 600 env file):
-  FEED_URL             RSS feed of the AION 2 X account (e.g. from rss.app)
+  FEED_URL             RSS feed(s) of AION 2 X accounts (e.g. from rss.app), one per line
   DISCORD_WEBHOOK_URL  Discord channel webhook (treat as a secret)
   DISCORD_ROLE_ID      Optional: role to @ping on maintenance posts
   CATEGORIES           Optional: which to relay (default: maintenance,event,update)
@@ -30,7 +30,8 @@ from zoneinfo import ZoneInfo
 import feedparser
 import requests
 
-FEED_URL = os.environ.get("FEED_URL")
+# One or more feeds: put each URL on its own line (or separate with commas/spaces).
+FEED_URLS = [u for u in re.split(r"[\s,]+", os.environ.get("FEED_URL", "")) if u]
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 SOURCE_TZ = os.environ.get("SOURCE_TZ", "KST").upper()
 STATE_FILE = os.environ.get("STATE_FILE", "aion2_seen.json")
@@ -248,13 +249,13 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)  # atomic: never leaves a half-written file
 
 
-def build_payload(cat, entry, text, tz_label, times):
+def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X"):
     embed = {
         "title": cat["title"],
         "url": entry.get("link"),
         "description": text[:3500],
         "color": cat["color"],
-        "footer": {"text": "AION 2 official X"},
+        "footer": {"text": source[:100]},
     }
     if times:
         embed["fields"] = [{"name": "🕒 Converted times", "value": format_times(tz_label, times)[:1024]}]
@@ -280,30 +281,64 @@ def post(payload):
         raise PostError(f"HTTP {r.status_code} {r.text[:200]}")
 
 
+def feed_key(url: str) -> str:
+    """State remembers feeds by hash: the state file is public, feed URLs are secrets."""
+    return hashlib.sha256(url.encode()).hexdigest()[:12]
+
+
+def entry_time(entry) -> datetime | None:
+    t = entry.get("published_parsed") or entry.get("updated_parsed")
+    return datetime(*t[:6], tzinfo=ZoneInfo("UTC")) if t else None
+
+
+def fetch_feeds(state):
+    """Return ([(entry, source, is_new_feed)] oldest first, failed feed count)."""
+    items, failed = [], 0
+    for n, url in enumerate(FEED_URLS, 1):
+        feed = feedparser.parse(url)
+        if not feed.entries:
+            # Skip this feed only; an empty first fetch would also cause a backlog flood later.
+            reason = type(feed.bozo_exception).__name__ if feed.bozo else "no entries"
+            print(f"Feed error (feed {n}): HTTP {feed.get('status', '?')}, {reason}")
+            failed += 1
+            continue
+        key = feed_key(url)
+        is_new = key not in state["feeds"]
+        if is_new:
+            state["feeds"].append(key)
+            print(f"feed {n} is new: recording its {len(feed.entries)} existing posts, nothing posted")
+        source = feed.feed.get("title") or "AION 2 official X"
+        items += [(e, source, is_new) for e in feed.entries]
+    # Feeds aren't reliably newest-first, so sort by date (undated last) to post in order.
+    far_future = datetime.max.replace(tzinfo=ZoneInfo("UTC"))
+    items.sort(key=lambda it: entry_time(it[0]) or far_future)
+    return items, failed
+
+
 def main():
-    if not FEED_URL or not WEBHOOK:
+    if not FEED_URLS or not WEBHOOK:
         sys.exit("Set FEED_URL and DISCORD_WEBHOOK_URL")
-    feed = feedparser.parse(FEED_URL)
-    if not feed.entries:
-        # Don't touch state on a bad fetch; an empty first run would also cause a backlog flood later.
-        reason = type(feed.bozo_exception).__name__ if feed.bozo else "no entries"
-        sys.exit(f"Feed error: HTTP {feed.get('status', '?')}, {reason}")
 
     state = load_state()
-    first_run = state is None
-    state = state or {"ids": [], "recent": {}}
+    if state is not None and "feeds" not in state:
+        # State from before multi-feed support: the single feed back then was FEED_URL's first line.
+        state["feeds"] = [feed_key(FEED_URLS[0])]
+    state = state or {"ids": [], "recent": {}, "feeds": []}
+
+    items, failures = fetch_feeds(state)
+    if not items:
+        sys.exit("Feed error: no feed could be read")  # don't touch state on a bad fetch
     seen_ids = set(state["ids"])
     now = datetime.now(ZoneInfo("UTC")).timestamp()
-    failures = 0
 
-    for entry in reversed(feed.entries):  # oldest first
+    for entry, source, is_new_feed in items:
         eid = tweet_key(entry)
         if eid in seen_ids:
             continue
         seen_ids.add(eid)
         state["ids"].append(eid)
-        if first_run:
-            continue  # don't spam backlog on first run
+        if is_new_feed:
+            continue  # don't spam a feed's backlog the first time we see it
 
         text = clean(entry.get("summary") or entry.get("title", ""))
         cat = classify(text)
@@ -311,9 +346,7 @@ def main():
             print(f"skipped (not important) {eid}")
             continue
 
-        published = None
-        if entry.get("published_parsed"):
-            published = datetime(*entry.published_parsed[:6], tzinfo=ZoneInfo("UTC"))
+        published = entry_time(entry)
         try:
             tz_label, times = parse_times(text, published)
         except Exception as e:  # odd date text must never block the post itself
@@ -327,7 +360,7 @@ def main():
             continue
 
         try:
-            post(build_payload(cat, entry, text, tz_label, times))
+            post(build_payload(cat, entry, text, tz_label, times, source))
         except PostError as e:
             # Not marked as seen, so it is retried next run instead of being lost.
             state["ids"].remove(eid)
@@ -341,7 +374,7 @@ def main():
         print(f"posted {cat['key']} {eid} ({len(times)} times)")
     save_state(state)
     if failures:
-        sys.exit(f"{failures} post(s) failed; they will be retried next run")  # makes the run show red
+        sys.exit(f"{failures} feed/post error(s) above; failed posts are retried next run")  # run shows red
 
 
 if __name__ == "__main__":
