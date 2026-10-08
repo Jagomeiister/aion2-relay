@@ -188,6 +188,13 @@ def format_times(tz_label, times):
 TWEET_ID_RE = re.compile(r"/status(?:es)?/(\d+)")
 URL_RE = re.compile(r"https?://\S+")
 DEDUPE_DAYS = 14  # how long to remember content/time-window fingerprints
+# Never post tweets older than this. A feed can suddenly expose older history it
+# never showed before (e.g. an rss.app plan change raising the item count).
+MAX_AGE_HOURS = 48
+# A newly added feed records its backlog without posting, except tweets this recent.
+NEW_FEED_RECENT_HOURS = 3
+# Maintenance tweets matching this are cancellations: own title, no ping.
+CANCEL_RE = re.compile(r"cancel|call(ed)? off|취소|중지|中止|キャンセル", re.I)
 
 
 def tweet_key(entry) -> str:
@@ -206,10 +213,10 @@ def content_fingerprint(text: str) -> str:
     return hashlib.sha256(t.encode()).hexdigest()[:16]
 
 
-def window_key(cat, times):
+def window_key(cat, times, text=""):
     """Maintenance with the same start time = same maintenance (catches reminder tweets)."""
-    if cat["key"] != "maintenance" or not times:
-        return None
+    if cat["key"] != "maintenance" or not times or CANCEL_RE.search(text):
+        return None  # a cancellation shares the start time but is news, not a reminder
     return f"maint:{times[0].astimezone(ZoneInfo('UTC')):%Y%m%d%H%M}"
 
 
@@ -249,18 +256,28 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)  # atomic: never leaves a half-written file
 
 
+HANDLE_RE = re.compile(r"(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status", re.I)
+
+
 def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X"):
+    cancelled = cat["key"] == "maintenance" and CANCEL_RE.search(text)
     embed = {
-        "title": cat["title"],
+        "title": "✅ Maintenance cancelled" if cancelled else cat["title"],
         "url": entry.get("link"),
         "description": text[:3500],
-        "color": cat["color"],
+        "color": 0xF1C40F if cancelled else cat["color"],
         "footer": {"text": source[:100]},
     }
+    # Which account tweeted it, e.g. "@AION2_JP", linked to the profile.
+    m = HANDLE_RE.search(entry.get("link") or "")
+    if m:
+        embed["author"] = {"name": f"@{m.group(1)}", "url": f"https://x.com/{m.group(1)}"}
+    else:
+        embed["author"] = {"name": source[:256]}
     if times:
         embed["fields"] = [{"name": "🕒 Converted times", "value": format_times(tz_label, times)[:1024]}]
     payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}  # no surprise @everyone
-    if cat["ping"] and ROLE_ID.isdigit():
+    if cat["ping"] and not cancelled and ROLE_ID.isdigit():
         payload["content"] = f"<@&{ROLE_ID}> maintenance incoming"
         payload["allowed_mentions"] = {"roles": [ROLE_ID]}
     return payload
@@ -337,8 +354,13 @@ def main():
             continue
         seen_ids.add(eid)
         state["ids"].append(eid)
-        if is_new_feed:
+        published = entry_time(entry)
+        age_hours = (now - published.timestamp()) / 3600 if published else None
+        if is_new_feed and (age_hours is None or age_hours > NEW_FEED_RECENT_HOURS):
             continue  # don't spam a feed's backlog the first time we see it
+        if age_hours is not None and age_hours > MAX_AGE_HOURS:
+            print(f"skipped (too old) {eid}")
+            continue
 
         text = clean(entry.get("summary") or entry.get("title", ""))
         cat = classify(text)
@@ -346,7 +368,6 @@ def main():
             print(f"skipped (not important) {eid}")
             continue
 
-        published = entry_time(entry)
         try:
             tz_label, times = parse_times(text, published)
         except Exception as e:  # odd date text must never block the post itself
@@ -354,7 +375,7 @@ def main():
             tz_label, times = SOURCE_TZ, []
 
         fp = "text:" + content_fingerprint(text)
-        wk = window_key(cat, times)
+        wk = window_key(cat, times, text)
         if is_repeat(state, fp, eid) or is_repeat(state, wk, eid):
             print(f"skipped (duplicate/reminder) {eid}")
             continue

@@ -1,7 +1,7 @@
 """Regression tests for aion2_maint_relay.py. Run: python -m pytest -q"""
 import json
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -138,6 +138,7 @@ def harness(tmp_path, monkeypatch):
         sent.append(payload)
 
     monkeypatch.setattr(r, "post", fake_post)
+    monkeypatch.setattr(r, "MAX_AGE_HOURS", 10**6)  # fixture dates are fixed, not relative to now
     feeds = {FEED_A: feed}  # url -> entries (oldest first); missing url = feed down
     monkeypatch.setattr(r, "FEED_URLS", [FEED_A])
 
@@ -278,3 +279,56 @@ def test_old_state_without_feeds_is_not_rebaselined(harness):
     h.feed += [entry(1, "hi"), entry(2, "Maintenance 10/9 10:00 KST", 1)]
     r.main()
     assert len(h.sent) == 1
+
+
+def at(tid, text, hours_ago):
+    t = datetime.now(UTC) - timedelta(hours=hours_ago)
+    return r.feedparser.FeedParserDict(link=f"https://x.com/aion2/status/{tid}", summary=text,
+                                       published_parsed=t.timetuple()[:6] + (0, 0, 0))
+
+
+def test_old_tweets_suddenly_in_feed_are_not_posted(harness, monkeypatch, capsys):
+    # A known feed starts exposing older history it never showed before (e.g. rss.app plan change).
+    h = harness
+    monkeypatch.setattr(r, "MAX_AGE_HOURS", 48)
+    h.feed.append(at(1, "hi", 1))
+    r.main()
+    h.feed[:0] = [at(5, "Login reward event!", 72)]  # old, newly visible
+    h.feed.append(at(6, "Patch notes are live", 0.1))  # genuinely new
+    r.main()
+    assert [p["embeds"][0]["url"][-1] for p in h.sent] == ["6"]
+    assert "skipped (too old) 5" in capsys.readouterr().out
+
+
+def test_new_feed_still_posts_very_recent_tweets(harness, monkeypatch):
+    # Adding a feed shouldn't swallow something tweeted minutes earlier (AION2_JP case).
+    h = harness
+    h.feed.append(at(1, "hi", 1))
+    r.main()
+    h.feeds[FEED_B] = [at(10, "Maintenance 10/1 10:00 KST", 30), at(11, "臨時メンテナンス 19:45より", 0.5)]
+    monkeypatch.setattr(r, "FEED_URLS", [FEED_A, FEED_B])
+    r.main()
+    assert [p["embeds"][0]["url"][-2:] for p in h.sent] == ["11"]
+
+
+@pytest.mark.parametrize("text", [
+    "📢臨時メンテナンス中止のお知らせ 本日19:45より予定しておりましたメンテナンスは中止",
+    "Today's maintenance has been cancelled",
+    "오늘 예정된 점검이 취소되었습니다",
+])
+def test_cancelled_maintenance_gets_its_own_title_and_no_ping(text, monkeypatch):
+    monkeypatch.setattr(r, "ROLE_ID", "987654321")
+    cat = r.classify(text)
+    assert cat["key"] == "maintenance"
+    p = r.build_payload(cat, {"link": ""}, text, "KST", [])
+    assert "cancel" in p["embeds"][0]["title"].lower() and "content" not in p
+
+
+@pytest.mark.parametrize("link,author", [
+    ("https://x.com/AION2_JP/status/2108147189541376329", "@AION2_JP"),
+    ("https://twitter.com/AION2Official/status/1", "@AION2Official"),
+    ("https://example.com/item/1", "src feed"),
+])
+def test_post_shows_source_account(link, author):
+    p = r.build_payload(r.classify("Patch notes"), {"link": link}, "Patch notes", "KST", [], "src feed")
+    assert p["embeds"][0]["author"]["name"] == author
