@@ -380,3 +380,47 @@ def test_range_detection(text, expected):
         assert len(ts) == 1 and expected in r.format_times("KST", ts)
     else:
         assert [e for s, e in ts] == [None, None]
+
+
+# --- "maintenance" used only as a deadline ---------------------------------
+
+GIVEAWAY_EN = """📢AION2 is hot right now!🔥
+
+Thanks to your warm support,
+Not only "AION2" but also "Character Creation" are trending in real time!🎉
+
+To express our gratitude for the overwhelming response, we will be giving away a "Character appearance change ticket (7 days) (engraved) x1" to all Diva who log in to the game before the start of regular maintenance on October 14th (Wednesday)!🎁
+
+Enjoy "AION2" even more with your unique character🪽
+
+🎁Gift items
+Character appearance change ticket (7 days) (engraved) ×1"""
+
+
+@pytest.mark.parametrize("text", [
+    GIVEAWAY_EN,
+    "📢今、AION2が熱い！🔥 10月14日(水)定期メンテナンス開始前までにゲームへログインしたすべてのディーヴァの皆さまへ「キャラクター外見変更券」をプレゼント！",
+    "정기 점검 전까지 접속한 모든 분께 선물을 드립니다!",
+    "Double EXP weekend! Runs until the next maintenance.",
+    "Log in after this week's maintenance to receive a gift!",
+])
+def test_deadline_mention_of_maintenance_is_not_maintenance(text):
+    cat = r.classify(text)
+    assert cat is not None and cat["key"] == "event"
+
+
+@pytest.mark.parametrize("text", [
+    "🪽Weekly Maintenance When: October 6, 2026 at 23:30 PDT / October 7, 2026 at 8h30 CEST",
+    "Day 1 Servers are currently under maintenance⚔️ Thank you for joining us in Atreia today!",
+    "[Notice of temporary maintenance on October 9th (Friday)] We will be conducting maintenance on the following dates.",
+    "【10月9日(金) 臨時メンテナンス実施のお知らせ】 下記の日程でメンテナンスを実施いたします。",
+    "정기 점검 안내: 10월 14일 06:00~10:00",
+    "Patch notes for 1.2 are out! Maintenance will be held 10:00-14:00 KST to apply this update.",
+    "Emergency maintenance notice. Please log out before the maintenance begins.",
+])
+def test_real_maintenance_notices_still_match(text):
+    assert r.classify(text)["key"] == "maintenance"
+
+
+def test_after_maintenance_patch_notes_are_an_update():
+    assert r.classify("Patch notes will be released after the maintenance.")["key"] == "update"

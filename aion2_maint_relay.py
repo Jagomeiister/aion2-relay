@@ -54,9 +54,9 @@ CATEGORIES = [
     {
         "key": "event",
         "pattern": re.compile(
-            r"\bevents?\b|festival|celebrat|campaign|login reward|attendance|double (xp|exp|drop)|"
-            r"limited[- ]time|giveaway|livestream|live stream|coupon|redeem|"
-            r"이벤트|출석|쿠폰|방송|イベント|キャンペーン|配信", re.I),
+            r"\bevents?\b|festival|celebrat|campaign|login reward|log-?in bonus|attendance|double (xp|exp|drop)|"
+            r"limited[- ]time|giveaway|giv(?:e|es|ing) away|\bgifts?\b|livestream|live stream|coupon|redeem|"
+            r"이벤트|출석|쿠폰|방송|선물|イベント|キャンペーン|配信|プレゼント|配布|ログインボーナス", re.I),
         "title": "🎉 Upcoming event",
         "color": 0x2ECC71,
         "ping": False,
@@ -73,11 +73,25 @@ CATEGORIES = [
 ]
 # Never relay these even if a keyword matches
 SKIP = re.compile(r"^(RT\b|R to @|@\w+)")
+# "Maintenance" used only as a deadline isn't a maintenance notice: "log in before the start of
+# regular maintenance on Oct 14", "until the next maintenance", "定期メンテナンス開始前までに",
+# "정기 점검 전까지". These phrases are blanked out before matching, so a giveaway can't post
+# as a red maintenance alert. Real notices ("Weekly Maintenance", "under maintenance",
+# "maintenance will be held 10:00-14:00") don't use this form and still match.
+INCIDENTAL_MAINT_RE = re.compile(
+    r"\b(?:before|until|till|after|following|prior to|ahead of|up to)\s+(?:the\s+)?"
+    r"(?:(?:start|beginning|end|completion)\s+of\s+(?:the\s+)?)?"
+    r"(?:(?:this|next)\s+)?(?:\w+['’]s\s+)?"
+    r"(?:(?:next|regular|scheduled|weekly|periodic|routine|upcoming|planned)\s+)*maint(?:enance)?\b"
+    r"|(?:定期|臨時)?メンテ(?:ナンス)?(?:開始|終了)?(?:前|後|まで|以降|明け)"
+    r"|(?:정기|임시)?\s*점검\s*(?:전까지|이전|이후|전|후|까지)",
+    re.I)
 
 
 def classify(text: str):
     if SKIP.search(text):
         return None
+    text = INCIDENTAL_MAINT_RE.sub(" ", text)
     for cat in CATEGORIES:
         if cat["key"] in ENABLED and cat["pattern"].search(text):
             return cat
