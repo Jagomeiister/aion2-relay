@@ -46,6 +46,13 @@ try:
 except ValueError:
     PREVIEW_PER_FEED = 3
 USER_AGENT = "aion2-relay (+https://github.com/Jagomeiister/aion2-relay)"
+# "⏰ Maintenance starts in ~N min" goes out this long before a maintenance (45-60 min with
+# 15-minute runs). No reminder if the announcement itself came less than 15 min before that.
+try:
+    REMINDER_MINUTES = max(15, int(float(os.environ.get("REMINDER_MINUTES") or 60)))
+except ValueError:
+    REMINDER_MINUTES = 60
+REMINDER_MIN_LEAD = 15
 
 # Checked in order: first match wins, so maintenance beats event/update.
 # English / Korean / Japanese keywords.
@@ -361,6 +368,47 @@ def parse_times(text: str, published: datetime | None, default_tz: str | None = 
     return (labels[0] if labels else dflt_label), results
 
 
+DURATION_RE = re.compile(  # "3 hours 30min", "5 hours 30 min", "90 minutes", "1時間30分", "1시간 30분"; not "8h30"
+    r"(?<![\d:.])(?:(\d{1,2})\s*(?:hours?|hrs?|h|時間|시간)(?:\s*(\d{1,2})\s*(?:minutes?|mins?|m|分|분))?"
+    r"|(\d{1,3})\s*(?:minutes?|mins?|分|분))(?![A-Za-z0-9])", re.I)
+DURATION_CONTEXT_RE = re.compile(r"duration|lasts?|takes?|approx|expected|所要|予定時間|程度|소요|예정", re.I)
+DURATION_LABEL_RE = re.compile(r"\(([^()]{1,40}?)(?:\s+servers?)?\)\s*:?\s*$", re.I)  # "Duration (ASIA servers): "
+
+
+def add_duration_ends(text: str, times):
+    """A post giving one start time plus durations gets end times: "When: 23:30 PDT ... Duration
+    (NA, EU, LATAM servers): 3 hours 30min. Duration (ASIA servers): 5 hours 30 min." -> two labelled
+    ranges. Returns (times, labels); posts with explicit ranges or several times are left alone."""
+    if not times or any(end for _, end in times) or len({s for s, _ in times}) != 1:
+        return times, [None] * len(times)
+    start, found = times[0][0], []
+    for m in DURATION_RE.finditer(text):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        line, before = text[line_start:line_end if line_end >= 0 else len(text)], text[line_start:m.start()]
+        in_brackets = before.count("(") + before.count("（") > before.count(")") + before.count("）")
+        if not (in_brackets or DURATION_CONTEXT_RE.search(line)):
+            continue  # "2 hours of new content" isn't how long the maintenance takes
+        hours, mins, only_mins = m.groups()
+        minutes = int(hours) * 60 + int(mins or 0) if hours else int(only_mins)
+        label = DURATION_LABEL_RE.search(before)
+        item = (minutes, label.group(1).strip() if label else None)
+        if 5 <= minutes <= 24 * 60 and item not in found:
+            found.append(item)
+    if not found:
+        return times, [None]
+    return [(start, start + timedelta(minutes=mins)) for mins, _ in found], [label for _, label in found]
+
+
+def tz_from_label(label: str):
+    """The zone a parse_times() label stands for: "JST", "PDT", "PT", "UTC+9"."""
+    m = re.fullmatch(r"UTC([+-])(\d{1,2})(?::(\d{2}))?", label or "")
+    if m:
+        offset = timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0))
+        return timezone(offset if m.group(1) == "+" else -offset, label)
+    return ZoneInfo(TZ_ALIASES.get(label) or SHORT_TZ.get(label) or "Asia/Seoul")
+
+
 def fmt_12h(dt) -> str:
     """e.g. "Thu 8 Oct 7:45 pm" (built by hand: %-I isn't portable)."""
     return f"{dt:%a} {dt.day} {dt:%b} {dt.hour % 12 or 12}:{dt.minute:02d} {'am' if dt.hour < 12 else 'pm'}"
@@ -378,13 +426,14 @@ def fmt_span(start, end) -> str:
     return f"{s} – {e}"
 
 
-def format_times(tz_label, times):
+def format_times(tz_label, times, labels=None):
     lines = []
-    for start, end in times:
+    for i, (start, end) in enumerate(times):
         name = start.tzname() or ""
         if not name or name[0] in "+-":  # zones without an abbreviation report "+08"
             name = tz_label
-        parts = [f"**{fmt_span(start, end)} {name}**"]
+        label = labels[i] if labels and i < len(labels) and labels[i] else ""
+        parts = [f"**{label + ': ' if label else ''}{fmt_span(start, end)} {name}**"]
         for name, tz in TARGETS:
             ls, le = start.astimezone(tz), end.astimezone(tz) if end else None
             parts.append(f"{name}: {fmt_span(ls, le)} {ls:%Z}")
@@ -428,7 +477,11 @@ def window_key(cat, times, text=""):
     announcements only: a cancellation/completion/extension shares the start time but is news."""
     if cat["key"] != "maintenance" or not times or maint_status(cat, text):
         return None
-    return f"maint:{times[0][0].astimezone(ZoneInfo('UTC')):%Y%m%d%H%M}"
+    return maint_key(times[0][0])
+
+
+def maint_key(start) -> str:
+    return f"maint:{start.astimezone(ZoneInfo('UTC')):%Y%m%d%H%M}"
 
 
 def load_state():
@@ -445,6 +498,7 @@ def load_state():
     data.setdefault("ids", [])
     data.setdefault("recent", {})  # fingerprint/window -> unix time first posted
     data.setdefault("schema", 2)  # state format version (its first write also proves git push works)
+    data.setdefault("upcoming", {})  # maintenance windows that may still need a reminder
     return data
 
 
@@ -464,6 +518,8 @@ def save_state(state):
     cutoff = now_ts() - DEDUPE_DAYS * 86400
     state["ids"] = state["ids"][-1000:]  # keep newest 1000, in order
     state["recent"] = {k: v for k, v in state["recent"].items() if recent_time(v) >= cutoff}
+    day_ago = now_ts() - 86400
+    state["upcoming"] = {k: w for k, w in state.get("upcoming", {}).items() if w["start"] >= day_ago}
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f, indent=1)
@@ -573,7 +629,7 @@ def quote_block(quote: str, url) -> str:
 
 
 def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X", quote="", quote_url=None,
-                  display=None, display_quote=None):
+                  display=None, display_quote=None, labels=None):
     """text/quote are what was classified; display/display_quote (with links) are what's shown."""
     status = maint_status(cat, text)
     title, color = cat["title"], cat["color"]
@@ -604,7 +660,7 @@ def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X",
     else:
         embed["author"] = {"name": source[:256]}
     if times:
-        embed["fields"] = [{"name": "🕒 Converted times", "value": format_times(tz_label, times)[:1024]}]
+        embed["fields"] = [{"name": "🕒 Converted times", "value": format_times(tz_label, times, labels)[:1024]}]
     payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}  # no surprise @everyone
     if cat["ping"] and status is None and ROLE_ID.isdigit():  # only plain "servers going down" posts ping
         payload["content"] = f"<@&{ROLE_ID}> maintenance incoming"
@@ -761,6 +817,92 @@ def fetch_feeds(state):
     return items, failed, statuses
 
 
+def window_record(info, eid, start):
+    """A pending maintenance window for state["upcoming"]: plain numbers and labels, no secrets."""
+    ranges = [[int(s.timestamp()), int(e.timestamp()) if e else None, label]
+              for (s, e), label in zip(info["times"], info["labels"] or [None] * len(info["times"])) if s == start]
+    return {"start": int(start.timestamp()), "tz": info["tz_label"], "id": eid,
+            "handle": info["handle"], "ranges": ranges}
+
+
+def note_maintenance(state, info, eid, now):
+    """Keep state["upcoming"] (maintenance that may need a reminder) in step with a posted
+    maintenance tweet: an announcement adds its window, a cancellation removes it, and a
+    reschedule moves it to the latest time mentioned."""
+    if info["cat"]["key"] != "maintenance" or info["status"] not in (None, "cancelled", "rescheduled"):
+        return
+    upcoming, status, times = state.setdefault("upcoming", {}), info["status"], info["times"]
+    if status is None:
+        if not times or times[0][0].timestamp() <= now:
+            return
+        w = upcoming.setdefault(maint_key(times[0][0]), window_record(info, eid, times[0][0]))
+        if w["start"] - now < (REMINDER_MINUTES + REMINDER_MIN_LEAD) * 60:
+            w.setdefault("reminded", int(now))  # announced so close to the start that the post is the warning
+        return
+    starts = {int(s.timestamp()) for s, _ in times}
+    new_start = max((s for s, _ in times), default=None) if status == "rescheduled" else None
+    hit = [k for k, w in upcoming.items() if w["start"] in starts and not w.get("cancelled")
+           and (new_start is None or w["start"] != int(new_start.timestamp()))]
+    if not hit:  # no time matches: the account's only pending window (next 24 h; 7 days for a reschedule)
+        horizon = 24 * 3600 if status == "cancelled" else 7 * 86400
+        pending = [k for k, w in upcoming.items() if w.get("handle") == info["handle"] and not w.get("cancelled")
+                   and now < w["start"] <= now + horizon
+                   and (new_start is None or w["start"] != int(new_start.timestamp()))]
+        hit = pending if len(pending) == 1 else []
+    for k in hit:
+        upcoming[k]["cancelled"] = int(now)
+    if new_start and new_start.timestamp() > now:
+        upcoming.setdefault(maint_key(new_start), window_record(info, eid, new_start))
+
+
+def reminder_payload(w, now):
+    minutes = max(5, int(round((w["start"] - now) / 300.0)) * 5)
+    tz = tz_from_label(w["tz"])
+    times = [(datetime.fromtimestamp(s, tz), datetime.fromtimestamp(e, tz) if e else None) for s, e, _ in w["ranges"]]
+    url = f"https://x.com/{w['handle']}/status/{w['id']}" if w.get("handle") else None
+    embed = {
+        "title": f"⏰ Maintenance starts in ~{minutes} min",
+        "description": f"Starts <t:{w['start']}:R>." + (f" [Original announcement]({url})" if url else ""),
+        "color": 0xE67E22,
+        "fields": [{"name": "🕒 Converted times",
+                    "value": format_times(w["tz"], times, [label for _, _, label in w["ranges"]])[:1024]}],
+        "footer": {"text": "Reminder"},
+    }
+    if url:
+        embed["url"] = url
+        embed["author"] = {"name": f"@{w['handle']}", "url": f"https://x.com/{w['handle']}"}
+    payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    if ROLE_ID.isdigit():
+        payload["content"] = f"<@&{ROLE_ID}> maintenance starts in ~{minutes} min"
+        payload["allowed_mentions"] = {"roles": [ROLE_ID]}
+    return payload
+
+
+def send_reminders(state, now) -> int:
+    """Post one "⏰ Maintenance starts in ~N min" per pending window, REMINDER_MINUTES before it.
+    Returns the number of failed posts (they're retried next run)."""
+    failures = 0
+    for key, w in sorted(state.get("upcoming", {}).items(), key=lambda kv: kv[1]["start"]):
+        if w.get("reminded") or w.get("cancelled"):
+            continue
+        left = w["start"] - now
+        if left <= 0:
+            w["reminded"] = int(now)  # runs were missed: never remind after the start
+            continue
+        if left > REMINDER_MINUTES * 60:
+            continue
+        try:
+            deliver(reminder_payload(w, now))
+        except PostError as e:
+            print(f"reminder failed {key}: {e}")
+            failures += 1
+            continue
+        w["reminded"] = int(now)
+        save_state(state)
+        print(f"reminded {key}")
+    return failures
+
+
 def decide(entry, source, state):
     """What to do with one feed entry: ("post", info with a payload) or (skip reason, info).
     Shared by real runs and preview, so a preview shows exactly what would be posted."""
@@ -785,9 +927,10 @@ def decide(entry, source, state):
         tz_label, times = parse_times(text, published, default_tz)
         if not times and quote:  # e.g. a reminder that quotes the original notice
             tz_label, times = parse_times(quote, published, default_tz)
+        times, labels = add_duration_ends(text, times)
     except Exception as e:  # odd date text must never block the post itself
         print(f"time parse failed {eid}: {type(e).__name__}: {e}")
-        tz_label, times = SOURCE_TZ, []
+        tz_label, times, labels = SOURCE_TZ, [], []
     status = maint_status(cat, text)
     fp = "text:" + content_fingerprint(text + quote)
     wk = window_key(cat, times, text)
@@ -796,8 +939,10 @@ def decide(entry, source, state):
     links = anchors(raw)
     display = tidy(linkify(text, links))
     display_quote = tidy(linkify(quote, links)) if quote else ""
-    payload = build_payload(cat, entry, text, tz_label, times, source, quote, quote_url, display, display_quote)
-    return "post", {"text": full, "cat": cat, "status": status, "times": times,
+    payload = build_payload(cat, entry, text, tz_label, times, source, quote, quote_url, display, display_quote,
+                            labels)
+    return "post", {"text": full, "cat": cat, "status": status, "times": times, "labels": labels,
+                    "tz_label": tz_label, "handle": author.group(1) if author else "",
                     "fp": fp, "wk": wk, "payload": payload}
 
 
@@ -817,6 +962,8 @@ def preview(state, items):
         print("text:", redact(json.dumps(info["text"][:1500], ensure_ascii=False)))
         if verdict == "post":
             deliver(info["payload"])  # prints, doesn't post
+    print("\n=== reminders due now (from saved state)")
+    send_reminders(state, now_ts())  # prints, doesn't post or save
 
 
 def main():
@@ -827,7 +974,7 @@ def main():
     if state is not None and "feeds" not in state:
         # State from before multi-feed support: the single feed back then was FEED_URL's first line.
         state["feeds"] = [feed_key(FEED_URLS[0])]
-    state = state or {"ids": [], "recent": {}, "feeds": [], "schema": 2}
+    state = state or {"ids": [], "recent": {}, "feeds": [], "schema": 2, "upcoming": {}}
 
     items, failures, statuses = fetch_feeds(state)
     if PREVIEW:
@@ -866,9 +1013,11 @@ def main():
         state["recent"][info["fp"]] = {"t": now, "id": eid}
         if info["wk"]:
             state["recent"][info["wk"]] = {"t": now, "id": eid}
+        note_maintenance(state, info, eid, now)
         save_state(state)  # save after every post, so a crash can't cause reposts
         kind = info["cat"]["key"] + (f"/{info['status']}" if info["status"] else "")
         print(f"posted {kind} {eid} ({len(info['times'])} times)")
+    failures += send_reminders(state, now)
     save_state(state)
     if failures:
         sys.exit(f"{failures} feed/post error(s) above; failed posts are retried next run")  # run shows red

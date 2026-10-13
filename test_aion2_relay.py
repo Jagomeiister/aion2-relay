@@ -808,3 +808,154 @@ def test_odd_html_never_crashes(raw):
     verdict, info = r.decide(e, GL_SOURCE, fresh_state())
     if verdict == "post":
         assert "javascript:" not in info["payload"]["embeds"][0]["description"]
+
+
+# --- step F: maintenance end times and reminders ------------------------------
+
+def test_weekly_notice_two_labelled_ranges():
+    weekly = next(c for c in CORPUS if c["id"] == "2107507473251004529")
+    _, info, _ = verdict_of(feed_entry(weekly["link"], weekly["text"]), weekly["source"])
+    assert info["labels"] == ["NA, EU, LATAM", "ASIA"] and info["wk"] == "maint:202610070630"
+    field = info["payload"]["embeds"][0]["fields"][0]["value"]
+    assert "**NA, EU, LATAM: Tue 6 Oct 11:30 pm – Wed 7 Oct 3:00 am PDT**" in field
+    assert "**ASIA: Tue 6 Oct 11:30 pm – Wed 7 Oct 5:00 am PDT**" in field
+    assert "Brisbane: Wed 7 Oct 4:30 – 10:00 pm AEST" in field
+
+
+def test_duration_never_overrides_a_range():
+    ts = r.parse_times(SCREENSHOT_TEXT, PUB, "JST")[1]
+    assert r.add_duration_ends(SCREENSHOT_TEXT, ts) == (ts, [None])
+    text = "Maintenance 10/9 19:45-20:45 (1時間30分)"
+    ts = r.parse_times(text, PUB)[1]
+    assert r.add_duration_ends(text, ts)[0] == ts
+
+
+def test_bracketed_duration_gives_an_end_time():
+    text = "メンテナンス 10月9日 19:45より(1時間30分)"
+    ts, labels = r.add_duration_ends(text, r.parse_times(text, PUB, "JST")[1])
+    assert [(hm(s), hm(e)) for s, e in ts] == [("2026-10-09 19:45", "2026-10-09 21:15")] and labels == [None]
+
+
+def test_duration_needs_context():
+    text = "Maintenance 10/9 10:00 KST. The patch brings 2 hours of new story content."
+    ts = r.parse_times(text, PUB)[1]
+    assert r.add_duration_ends(text, ts) == (ts, [None])
+
+
+T0 = datetime(2026, 10, 20, 0, 0, tzinfo=UTC).timestamp()  # Tue 20 Oct, 09:00 KST
+START = T0 + 5 * 3600                                       # 14:00 KST
+ANNOUNCE = "Maintenance 10/20 14:00 ~ 18:00 KST"
+
+
+def tweet(tid, text, ts):
+    return r.feedparser.FeedParserDict(link=f"https://x.com/AION2Official/status/{tid}", summary=text,
+                                       published_parsed=datetime.fromtimestamp(ts, UTC).timetuple())
+
+
+def run_at(h, ts):
+    h.clock["now"] = ts
+    r.main()
+
+
+def announce(h, text=ANNOUNCE, ts=T0):
+    h.feed.append(tweet(1, "hi", T0 - 3600))
+    run_at(h, T0 - 3600)  # baseline
+    h.feed.append(tweet(2, text, ts))
+    run_at(h, ts)
+
+
+def test_reminder_once_about_an_hour_before(harness):
+    h = harness
+    announce(h)
+    assert len(h.sent) == 1
+    assert json.loads(h.state.read_text())["upcoming"]["maint:202610200500"]["start"] == START
+    for minutes_before in (90, 75):
+        run_at(h, START - minutes_before * 60)
+    assert len(h.sent) == 1                                     # not yet
+    run_at(h, START - 55 * 60)
+    assert len(h.sent) == 2
+    reminder = h.sent[1]["embeds"][0]
+    assert reminder["title"] == "⏰ Maintenance starts in ~55 min"
+    assert "Brisbane: Tue 20 Oct 3:00 – 7:00 pm AEST" in reminder["fields"][0]["value"]
+    assert reminder["url"].endswith("/status/2") and "content" not in h.sent[1]
+    for minutes_before in (40, 10, -5):
+        run_at(h, START - minutes_before * 60)
+    assert len(h.sent) == 2                                     # once only, never after the start
+    run_at(h, START + 25 * 3600)
+    assert json.loads(h.state.read_text())["upcoming"] == {}    # pruned a day after the start
+
+
+def test_reminder_pings_role_when_set(harness, monkeypatch):
+    monkeypatch.setattr(r, "ROLE_ID", "123")
+    announce(harness)
+    run_at(harness, START - 55 * 60)
+    assert harness.sent[1]["content"] == "<@&123> maintenance starts in ~55 min"
+    assert harness.sent[1]["allowed_mentions"] == {"roles": ["123"]}
+
+
+def test_no_reminder_when_announced_close_to_start(harness):
+    announce(harness, "Maintenance 10/20 10:10 KST")          # 70 min ahead: the post is the warning
+    run_at(harness, T0 + 15 * 60)
+    assert len(harness.sent) == 1
+
+
+def test_reminder_tweet_does_not_double_up(harness):
+    h = harness
+    announce(h)
+    h.feed.append(tweet(3, "Reminder: maintenance starts 10/20 14:00 KST", T0 + 3600))
+    run_at(h, T0 + 3600)
+    run_at(h, START - 55 * 60)
+    assert len(h.sent) == 2 and len(json.loads(h.state.read_text())["upcoming"]) == 1
+
+
+def test_cancellation_with_a_time_cancels_the_reminder(harness):
+    h = harness
+    announce(h)
+    h.feed.append(tweet(3, "Today's maintenance (10/20 14:00 KST) is cancelled", T0 + 3600))
+    run_at(h, T0 + 3600)
+    run_at(h, START - 55 * 60)
+    assert [p["embeds"][0]["title"] for p in h.sent] == ["🚨 MAINTENANCE — servers going down", "✅ Maintenance cancelled"]
+
+
+def test_cancellation_without_a_time_cancels_the_only_pending_window(harness):
+    h = harness
+    announce(h)
+    h.feed.append(tweet(3, "Today's maintenance has been cancelled.", T0 + 3600))
+    run_at(h, T0 + 3600)
+    run_at(h, START - 55 * 60)
+    assert len(h.sent) == 2 and "cancelled" in h.sent[1]["embeds"][0]["title"]
+
+
+def test_reschedule_moves_the_reminder(harness):
+    h = harness
+    announce(h)
+    h.feed.append(tweet(3, "Maintenance has been postponed to 10/21 14:00 KST", T0 + 3600))
+    run_at(h, T0 + 3600)
+    run_at(h, START - 55 * 60)
+    assert len(h.sent) == 2                                     # old time: no reminder
+    run_at(h, START + 86400 - 55 * 60)
+    assert h.sent[2]["embeds"][0]["title"] == "⏰ Maintenance starts in ~55 min"
+    assert h.sent[2]["embeds"][0]["url"].endswith("/status/3")
+
+
+def test_failed_reminder_is_retried(harness):
+    h = harness
+    announce(h)
+    h.fail["on"] = True
+    with pytest.raises(SystemExit):
+        run_at(h, START - 55 * 60)
+    h.fail["on"] = False
+    run_at(h, START - 50 * 60)
+    assert h.sent[-1]["embeds"][0]["title"] == "⏰ Maintenance starts in ~50 min"
+
+
+def test_preview_shows_due_reminders(harness, monkeypatch, capsys):
+    h = harness
+    announce(h)
+    before = h.state.read_bytes()
+    monkeypatch.setattr(r, "PREVIEW", True)
+    h.clock["now"] = START - 55 * 60
+    capsys.readouterr()
+    r.main()
+    assert "⏰ Maintenance starts in ~55 min" in capsys.readouterr().out
+    assert len(h.sent) == 1 and h.state.read_bytes() == before
