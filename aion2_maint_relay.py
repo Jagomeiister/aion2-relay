@@ -810,7 +810,8 @@ def fetch_feeds(state):
         source = feed.feed.get("title") or "AION 2 official X"
         items += [(e, source, is_new, n) for e in feed.entries]
         dated = [t for t in map(entry_time, feed.entries) if t]
-        statuses.append({"n": n, "key": key, "ok": True, "newest": max(dated) if dated else None})
+        statuses.append({"n": n, "key": key, "ok": True, "newest": max(dated) if dated else None,
+                         "handle": feed_identity(source)[1]})
     # Feeds aren't reliably newest-first, so sort by date (undated last) to post in order.
     far_future = datetime.max.replace(tzinfo=ZoneInfo("UTC"))
     items.sort(key=lambda it: entry_time(it[0]) or far_future)
@@ -903,6 +904,88 @@ def send_reminders(state, now) -> int:
     return failures
 
 
+FEED_DOWN_MINUTES = 60   # a feed failing this long gets one alert
+STALE_DAYS = 3           # a feed with no new tweets this long gets one warning
+TRIGGER_STALE_MINUTES = 60
+
+
+def notify(text: str) -> bool:
+    """Plain-text bot-health message in the news channel (no pings). False if posting failed."""
+    try:
+        deliver({"content": text, "allowed_mentions": {"parse": []}})
+    except PostError as e:
+        print(f"alert failed: {e}")
+        return False
+    return True
+
+
+def check_feed_health(state, statuses, now) -> int:
+    """Alert once when a feed has been down FEED_DOWN_MINUTES (and once when it's back), and once
+    when a feed has had no new tweets for STALE_DAYS. State only changes on those transitions, so a
+    long outage doesn't make a commit every run. Returns the number of failed alert posts."""
+    health, failures = state.setdefault("feed_health", {}), 0
+    for st in statuses:
+        rec = health.setdefault(st["key"], {})
+        who = f"Feed {st['n']}" + (f" (@{rec['handle']})" if rec.get("handle") else "")
+        if not st["ok"]:
+            if "fail_since" not in rec:
+                rec["fail_since"] = int(now)
+            elif not rec.get("alerted") and now - rec["fail_since"] >= FEED_DOWN_MINUTES * 60:
+                if notify(f"⚠️ {who} hasn't loaded for over an hour ({st['problem']}) — check rss.app"):
+                    rec["alerted"], rec["problem"] = int(now), st["problem"]
+                else:
+                    failures += 1
+            continue
+        if st.get("handle") and rec.get("handle") != st["handle"]:
+            rec["handle"] = st["handle"]
+            who = f"Feed {st['n']} (@{st['handle']})"
+        if "fail_since" in rec:
+            if rec.get("alerted"):
+                down_h = max(1, round((now - rec["fail_since"]) / 3600))
+                if not notify(f"✅ {who} is working again (was down ~{down_h} h)"):
+                    failures += 1
+                    continue
+            for k in ("fail_since", "alerted", "problem"):
+                rec.pop(k, None)
+        newest = int(st["newest"].timestamp()) if st.get("newest") else None
+        if newest and newest > rec.get("newest", 0):
+            rec["newest"] = newest
+            rec.pop("stale_alerted", None)
+        if rec.get("newest") and now - rec["newest"] > STALE_DAYS * 86400 and not rec.get("stale_alerted"):
+            days = int((now - rec["newest"]) // 86400)
+            if notify(f"⚠️ {who}: no new tweets for {days} days — check the rss.app feed is still updating"):
+                rec["stale_alerted"] = int(now)
+            else:
+                failures += 1
+    configured = {st["key"] for st in statuses}
+    state["feed_health"] = {k: v for k, v in health.items() if k in configured}
+    return failures
+
+
+def check_trigger(state, now) -> int:
+    """On GitHub's own scheduled runs the workflow passes LAST_DISPATCH (the last cron-job.org run).
+    Warn once if it's over TRIGGER_STALE_MINUTES old (e.g. its GitHub token expired), and once
+    when it's running again. Other runs don't set LAST_DISPATCH and check nothing."""
+    try:
+        last = datetime.fromisoformat(os.environ["LAST_DISPATCH"].strip().replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError):
+        return 0
+    rec = state.setdefault("trigger_health", {})
+    if now - last > TRIGGER_STALE_MINUTES * 60:
+        if rec.get("alerted"):
+            return 0
+        hours = max(1, round((now - last) / 3600))
+        if not notify(f"⚠️ The 15-minute trigger (cron-job.org) hasn't run for ~{hours} h — check the "
+                      "cron-job.org job and its GitHub token. GitHub's own backup timer still runs a few times a day."):
+            return 1
+        rec["alerted"] = int(now)
+    elif rec.get("alerted"):
+        if not notify("✅ The 15-minute trigger (cron-job.org) is running again"):
+            return 1
+        rec.pop("alerted")
+    return 0
+
+
 def decide(entry, source, state):
     """What to do with one feed entry: ("post", info with a payload) or (skip reason, info).
     Shared by real runs and preview, so a preview shows exactly what would be posted."""
@@ -946,7 +1029,7 @@ def decide(entry, source, state):
                     "fp": fp, "wk": wk, "payload": payload}
 
 
-def preview(state, items):
+def preview(state, items, statuses=()):
     """PREVIEW=1: show what the newest tweets of each feed would post as. Posts and saves nothing."""
     print(f"PREVIEW: newest {PREVIEW_PER_FEED} tweets per feed; nothing is posted or saved")
     shown = {}
@@ -964,6 +1047,9 @@ def preview(state, items):
             deliver(info["payload"])  # prints, doesn't post
     print("\n=== reminders due now (from saved state)")
     send_reminders(state, now_ts())  # prints, doesn't post or save
+    print("\n=== bot-health alerts due now")
+    check_feed_health(state, list(statuses), now_ts())
+    check_trigger(state, now_ts())
 
 
 def main():
@@ -978,9 +1064,9 @@ def main():
 
     items, failures, statuses = fetch_feeds(state)
     if PREVIEW:
-        return preview(state, items)
-    if not items:
-        sys.exit("Feed error: no feed could be read")  # don't touch state on a bad fetch
+        return preview(state, items, statuses)
+    # Even with every feed down this carries on, so reminders and alerts still go out; feeds that
+    # failed to load are never marked seen or baselined (fetch_feeds only records loaded feeds).
     seen_ids = set(state["ids"])
     now = now_ts()
 
@@ -1018,7 +1104,11 @@ def main():
         kind = info["cat"]["key"] + (f"/{info['status']}" if info["status"] else "")
         print(f"posted {kind} {eid} ({len(info['times'])} times)")
     failures += send_reminders(state, now)
+    failures += check_feed_health(state, statuses, now)
+    failures += check_trigger(state, now)
     save_state(state)
+    if not items:
+        sys.exit("Feed error: no feed could be read")
     if failures:
         sys.exit(f"{failures} feed/post error(s) above; failed posts are retried next run")  # run shows red
 

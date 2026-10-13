@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: write             # only needed to commit the seen-posts state file
+  actions: read               # lets GitHub's own scheduled runs check the cron-job.org trigger
 
 concurrency:
   # Previews get their own group: GitHub keeps only one pending run per group, so a queued
@@ -44,6 +45,18 @@ jobs:
           cache: pip
 
       - run: pip install -r requirements.txt
+
+      - name: Check the 15-minute trigger
+        # Only on GitHub's own (backup) schedule: when did cron-job.org last start a run?
+        # The relay posts a warning if that was over an hour ago (e.g. its token expired).
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh run list -R "$GITHUB_REPOSITORY" --workflow aion2-relay.yml --event workflow_dispatch \
+                 --branch main --limit 1 --json createdAt -q '.[0].createdAt // ""' || true)
+          echo "Last cron-job.org run: ${last:-none found}"
+          echo "LAST_DISPATCH=$last" >> "$GITHUB_ENV"
 
       - name: Check feed and post to Discord
         env:

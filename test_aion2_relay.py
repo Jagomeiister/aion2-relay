@@ -146,8 +146,10 @@ def harness(tmp_path, monkeypatch):
 
     monkeypatch.setattr(r, "post", fake_post)
     monkeypatch.setattr(r, "MAX_AGE_HOURS", 10**6)  # fixture dates are fixed, not relative to now
+    monkeypatch.setattr(r, "STALE_DAYS", 10**6)     # same reason; the stale-feed tests set it themselves
     feeds = {FEED_A: feed}  # url -> entries (oldest first); missing url = feed down
     problems = {}  # url -> problem text reported while that feed is down
+    titles = {}    # url -> feed title (default "src <end of url>")
     monkeypatch.setattr(r, "FEED_URLS", [FEED_A])
 
     def fake_fetch(url):
@@ -155,13 +157,14 @@ def harness(tmp_path, monkeypatch):
         if not entries:
             return None, problems.get(url, "HTTP 404")
         # feedparser returns newest first
-        return SimpleNamespace(entries=list(reversed(entries)), feed={"title": f"src {url[-5:]}"}), None
+        return SimpleNamespace(entries=list(reversed(entries)), feed={"title": titles.get(url, f"src {url[-5:]}")}), None
 
     monkeypatch.setattr(r, "fetch_feed", fake_fetch)
     clock = {"now": None}  # None = real time
     monkeypatch.setattr(r, "now_ts", lambda: clock["now"] if clock["now"] is not None else time.time())
+    monkeypatch.delenv("LAST_DISPATCH", raising=False)
     return SimpleNamespace(state=state, sent=sent, feed=feed, fail=fail, feeds=feeds,
-                           problems=problems, clock=clock)
+                           problems=problems, clock=clock, titles=titles)
 
 
 @pytest.fixture(autouse=True)
@@ -959,3 +962,140 @@ def test_preview_shows_due_reminders(harness, monkeypatch, capsys):
     r.main()
     assert "⏰ Maintenance starts in ~55 min" in capsys.readouterr().out
     assert len(h.sent) == 1 and h.state.read_bytes() == before
+
+
+# --- step G: problem alerts ---------------------------------------------------
+
+def alerts(h):
+    return [p["content"] for p in h.sent if "embeds" not in p]
+
+
+def test_feed_down_alert_after_an_hour_then_recovery(harness, monkeypatch):
+    h = harness
+    monkeypatch.setattr(r, "FEED_URLS", [FEED_A, FEED_B])
+    h.titles[FEED_B] = "AION2 (@AION2_JP) / Twitter"
+    h.feed.append(tweet(1, "hi", T0 - 7200))
+    h.feeds[FEED_B] = [tweet(2, "hi", T0 - 7200)]
+    run_at(h, T0)                                           # both load (baseline)
+    del h.feeds[FEED_B]
+    for minutes in (0, 30):
+        with pytest.raises(SystemExit):                     # every failing run still shows red
+            run_at(h, T0 + 900 + minutes * 60)
+    assert alerts(h) == []                                  # under an hour: quiet
+    with pytest.raises(SystemExit):
+        run_at(h, T0 + 900 + 65 * 60)
+    assert alerts(h) == ["⚠️ Feed 2 (@AION2_JP) hasn't loaded for over an hour (HTTP 404) — check rss.app"]
+    after_alert = h.state.read_bytes()
+    with pytest.raises(SystemExit):
+        run_at(h, T0 + 900 + 80 * 60)
+    assert len(alerts(h)) == 1 and h.state.read_bytes() == after_alert  # no repeat, nothing to commit
+    h.feeds[FEED_B] = [tweet(2, "hi", T0 - 7200)]
+    run_at(h, T0 + 900 + 95 * 60)
+    assert alerts(h)[-1] == "✅ Feed 2 (@AION2_JP) is working again (was down ~2 h)"
+    assert "secret" not in "".join(alerts(h))
+
+
+def test_short_outage_is_silent(harness):
+    h = harness
+    h.feed.append(tweet(1, "hi", T0 - 7200))
+    run_at(h, T0)
+    saved = list(h.feed)
+    h.feed.clear()
+    with pytest.raises(SystemExit):
+        run_at(h, T0 + 900)
+    h.feed.extend(saved)
+    run_at(h, T0 + 1800)
+    assert alerts(h) == []
+    assert "fail_since" not in json.loads(h.state.read_text())["feed_health"][r.feed_key(FEED_A)]
+
+
+def test_all_feeds_down_still_alerts_and_reminds(harness):
+    h = harness
+    announce(h)
+    h.feed.clear()
+    with pytest.raises(SystemExit):
+        run_at(h, START - 120 * 60)
+    with pytest.raises(SystemExit):
+        run_at(h, START - 55 * 60)
+    assert [p["embeds"][0]["title"] for p in h.sent if "embeds" in p][-1] == "⏰ Maintenance starts in ~55 min"
+    assert alerts(h) == ["⚠️ Feed 1 hasn't loaded for over an hour (HTTP 404) — check rss.app"]
+
+
+def test_stale_feed_warns_once_and_resets(harness, monkeypatch):
+    h = harness
+    monkeypatch.setattr(r, "STALE_DAYS", 3)
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 3600)
+    run_at(h, T0 + 2 * 86400)
+    assert alerts(h) == []
+    run_at(h, T0 + 4 * 86400)
+    run_at(h, T0 + 4 * 86400 + 900)
+    assert alerts(h) == ["⚠️ Feed 1: no new tweets for 4 days — check the rss.app feed is still updating"]
+    h.feed.append(tweet(2, "hello", T0 + 5 * 86400))       # tweets again: the warning resets
+    run_at(h, T0 + 5 * 86400 + 600)
+    run_at(h, T0 + 9 * 86400)
+    assert len(alerts(h)) == 2
+
+
+def test_quiet_runs_do_not_change_state(harness):
+    h = harness
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    first = h.state.read_bytes()
+    for i in range(1, 4):
+        run_at(h, T0 + 60 + i * 900)
+    assert h.state.read_bytes() == first
+
+
+def test_failed_alert_is_retried(harness):
+    h = harness
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    h.feed.clear()
+    with pytest.raises(SystemExit):
+        run_at(h, T0 + 900)
+    h.fail["on"] = True
+    with pytest.raises(SystemExit):
+        run_at(h, T0 + 900 + 65 * 60)
+    h.fail["on"] = False
+    with pytest.raises(SystemExit):
+        run_at(h, T0 + 900 + 80 * 60)
+    assert len(alerts(h)) == 1
+
+
+def test_trigger_watchdog(harness, monkeypatch):
+    h = harness
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+
+    def iso(ts):
+        return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    monkeypatch.setenv("LAST_DISPATCH", iso(T0 + 60))
+    run_at(h, T0 + 600)                                     # recent dispatch: quiet
+    run_at(h, T0 + 3 * 3600)                                # ~3 h without one
+    run_at(h, T0 + 4 * 3600)
+    assert alerts(h) == ["⚠️ The 15-minute trigger (cron-job.org) hasn't run for ~3 h — check the cron-job.org "
+                         "job and its GitHub token. GitHub's own backup timer still runs a few times a day."]
+    monkeypatch.setenv("LAST_DISPATCH", iso(T0 + 4 * 3600 + 300))
+    run_at(h, T0 + 4 * 3600 + 600)
+    assert alerts(h)[-1] == "✅ The 15-minute trigger (cron-job.org) is running again"
+    monkeypatch.delenv("LAST_DISPATCH")
+    run_at(h, T0 + 9 * 3600)                                # not a scheduled run: nothing checked
+    assert len(alerts(h)) == 2
+
+
+def test_preview_shows_due_alerts_without_saving(harness, monkeypatch, capsys):
+    h = harness
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    h.feed.clear()
+    with pytest.raises(SystemExit):
+        run_at(h, T0 + 900)
+    before = h.state.read_bytes()
+    monkeypatch.setattr(r, "PREVIEW", True)
+    h.clock["now"] = T0 + 900 + 65 * 60
+    capsys.readouterr()
+    r.main()
+    assert "hasn't loaded for over an hour" in capsys.readouterr().out
+    assert alerts(h) == [] and h.state.read_bytes() == before
