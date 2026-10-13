@@ -6,16 +6,25 @@ on:
     # busiest at the start of each hour, so the :00 run is the likeliest to be late.
     - cron: "0,15,30,45 * * * *"
   workflow_dispatch:          # lets you trigger it manually from the Actions tab
+    inputs:
+      preview:
+        description: "Preview only: show what the newest tweets would post as. Posts and saves nothing."
+        type: boolean
+        default: false
 
 permissions:
   contents: write             # only needed to commit the seen-posts state file
 
 concurrency:
-  group: aion2-relay
+  # Previews get their own group: GitHub keeps only one pending run per group, so a queued
+  # preview could otherwise cancel a queued real run.
+  group: ${{ inputs.preview && 'aion2-preview' || 'aion2-relay' }}
   cancel-in-progress: false   # never run two at once (avoids double posts)
 
 jobs:
   relay:
+    # Only main posts for real; any branch can be previewed.
+    if: inputs.preview || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -40,10 +49,12 @@ jobs:
           CATEGORIES: maintenance,event,update                   # drop any you don't want
           SOURCE_TZ: KST
           STATE_FILE: aion2_seen.json
+          PREVIEW: ${{ inputs.preview && '1' || '' }}
         run: python aion2_maint_relay.py
 
       - name: Save seen-posts state
-        if: success() || failure()  # also after a failed post, so successful ones aren't reposted
+        # Also after a failed post, so successful ones aren't reposted. Never in preview.
+        if: (success() || failure()) && !inputs.preview
         run: |
           [ -f aion2_seen.json ] || { echo "No state file yet"; exit 0; }
           git config user.name "aion2-relay-bot"

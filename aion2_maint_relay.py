@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -38,6 +39,10 @@ STATE_FILE = os.environ.get("STATE_FILE", "aion2_seen.json")
 
 ROLE_ID = os.environ.get("DISCORD_ROLE_ID", "").strip()
 ENABLED = {c.strip().lower() for c in os.environ.get("CATEGORIES", "maintenance,event,update").split(",")}
+# PREVIEW=1: print what the newest tweets of each feed would post as. Posts and saves nothing.
+PREVIEW = os.environ.get("PREVIEW", "").strip().lower() in ("1", "true", "yes")
+PREVIEW_PER_FEED = 3
+USER_AGENT = "aion2-relay (+https://github.com/Jagomeiister/aion2-relay)"
 
 # Checked in order: first match wins, so maintenance beats event/update.
 # English / Korean / Japanese keywords.
@@ -307,7 +312,9 @@ def is_repeat(state, key, eid):
 
 
 def save_state(state):
-    cutoff = datetime.now(ZoneInfo("UTC")).timestamp() - DEDUPE_DAYS * 86400
+    if PREVIEW:
+        return  # a preview never writes state
+    cutoff = now_ts() - DEDUPE_DAYS * 86400
     state["ids"] = state["ids"][-1000:]  # keep newest 1000, in order
     state["recent"] = {k: v for k, v in state["recent"].items() if recent_time(v) >= cutoff}
     tmp = STATE_FILE + ".tmp"
@@ -343,19 +350,84 @@ def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X")
     return payload
 
 
+def now_ts() -> float:
+    """Current unix time (one seam, so tests can set the clock)."""
+    return time.time()
+
+
+def sleep(seconds: float):
+    time.sleep(seconds)  # one seam, so tests don't really wait
+
+
 class PostError(Exception):
-    pass
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status
+
+
+MAX_RATE_WAIT = 10  # seconds; a longer Discord rate limit fails the post (retried next run)
+
+
+def rate_wait(r) -> float:
+    """Seconds Discord asks us to wait after a 429. Headers first: the JSON retry_after's
+    units differ between API versions."""
+    for header in ("Retry-After", "X-RateLimit-Reset-After"):
+        try:
+            return float(r.headers[header])
+        except (KeyError, TypeError, ValueError):
+            pass
+    try:
+        data = r.json()
+    except ValueError:
+        return 1.0
+    return float(data.get("retry_after", 1)) if isinstance(data, dict) else 1.0
 
 
 def post(payload):
     # Never let the webhook URL reach the log: requests puts the full URL in
     # raise_for_status() and connection-error messages, and public repo logs are public.
-    try:
-        r = requests.post(WEBHOOK, json=payload, timeout=15)
-    except requests.RequestException as e:
-        raise PostError(type(e).__name__) from None
-    if r.status_code >= 400:
-        raise PostError(f"HTTP {r.status_code} {r.text[:200]}")
+    for attempt in range(3):
+        try:
+            r = requests.post(WEBHOOK, json=payload, timeout=15)
+        except requests.RequestException as e:
+            raise PostError(type(e).__name__) from None
+        if r.status_code == 429 and attempt < 2:
+            wait = rate_wait(r)
+            if wait > MAX_RATE_WAIT:
+                raise PostError(f"HTTP 429 (retry after {wait:.0f}s)", 429)
+            sleep(wait)
+            continue
+        if r.status_code >= 400:
+            raise PostError(f"HTTP {r.status_code} {r.text[:200]}", r.status_code)
+        return
+
+
+def deliver(payload):
+    """Send one Discord message; in preview mode print it instead."""
+    if PREVIEW:
+        print(redact(json.dumps(payload, ensure_ascii=False, indent=1)))
+        return
+    post(payload)
+
+
+RSS_APP_URL_RE = re.compile(r"https?://(?:[\w-]+\.)*rss\.app\b[^\s\"'<>)\]]*", re.I)
+
+
+def redact(text: str) -> str:
+    """Remove secrets before printing to the (public) Actions log."""
+    for secret in [*FEED_URLS, WEBHOOK or ""]:
+        if secret:
+            text = text.replace(secret, "[secret]")
+    return RSS_APP_URL_RE.sub("[rss.app URL]", text)
+
+
+def html_skeleton(raw: str) -> str:
+    """An entry's HTML tag structure (tag and class names only, no text) for preview logs."""
+    out = []
+    for close, name, attrs in re.findall(r"<(/?)([a-zA-Z][\w-]*)([^>]*)>", raw or ""):
+        cls = re.search(r"""class\s*=\s*["']([^"']*)""", attrs)
+        out.append(f"<{close}{name.lower()}{'.' + '.'.join(cls.group(1).split()) if cls else ''}>")
+    return " ".join(out)[:1500]
 
 
 def feed_key(url: str) -> str:
@@ -368,32 +440,100 @@ def entry_time(entry) -> datetime | None:
     return datetime(*t[:6], tzinfo=ZoneInfo("UTC")) if t else None
 
 
+def fetch_feed(url):
+    """Download and parse one feed: (feed, None), or (None, problem). The problem is like "HTTP 404"
+    or an exception name, never the URL (feed URLs are secrets; logs are public)."""
+    problem = None
+    for attempt in (1, 2):
+        try:
+            r = requests.get(url, timeout=(5, 20), headers={"User-Agent": USER_AGENT})
+        except requests.RequestException as e:
+            problem = type(e).__name__
+        else:
+            if r.status_code < 400:
+                feed = feedparser.parse(
+                    r.content, response_headers={"content-type": r.headers.get("Content-Type", "")})
+                if feed.entries:
+                    return feed, None
+                # An empty first fetch would also cause a backlog flood later, so it's an error.
+                return None, type(feed.bozo_exception).__name__ if feed.bozo else "no entries"
+            problem = f"HTTP {r.status_code}"
+            if r.status_code < 500:
+                break  # a 4xx won't fix itself in 3 seconds
+        if attempt == 1:
+            sleep(3)
+    return None, problem
+
+
 def fetch_feeds(state):
-    """Return ([(entry, source, is_new_feed)] oldest first, failed feed count)."""
-    items, failed = [], 0
+    """Return ([(entry, source, is_new_feed, feed_number)] oldest first, failed feed count,
+    per-feed statuses)."""
+    items, failed, statuses = [], 0, []
     for n, url in enumerate(FEED_URLS, 1):
-        feed = feedparser.parse(url)
-        if not feed.entries:
-            # Skip this feed only; an empty first fetch would also cause a backlog flood later.
-            reason = type(feed.bozo_exception).__name__ if feed.bozo else "no entries"
-            print(f"Feed error (feed {n}): HTTP {feed.get('status', '?')}, {reason}")
-            failed += 1
-            continue
         key = feed_key(url)
+        feed, problem = fetch_feed(url)
+        if feed is None:
+            print(f"Feed error (feed {n}): {problem}")  # skip this feed only
+            failed += 1
+            statuses.append({"n": n, "key": key, "ok": False, "problem": problem})
+            continue
         is_new = key not in state["feeds"]
         if is_new:
             state["feeds"].append(key)
             print(f"feed {n} is new: recording its {len(feed.entries)} existing posts, nothing posted")
         source = feed.feed.get("title") or "AION 2 official X"
-        items += [(e, source, is_new) for e in feed.entries]
+        items += [(e, source, is_new, n) for e in feed.entries]
+        dated = [t for t in map(entry_time, feed.entries) if t]
+        statuses.append({"n": n, "key": key, "ok": True, "newest": max(dated) if dated else None})
     # Feeds aren't reliably newest-first, so sort by date (undated last) to post in order.
     far_future = datetime.max.replace(tzinfo=ZoneInfo("UTC"))
     items.sort(key=lambda it: entry_time(it[0]) or far_future)
-    return items, failed
+    return items, failed, statuses
+
+
+def decide(entry, source, state):
+    """What to do with one feed entry: ("post", info) or (skip reason, None). Shared by real runs
+    and preview, so a preview shows exactly what would be posted."""
+    eid = tweet_key(entry)
+    text = clean(entry.get("summary") or entry.get("title", ""))
+    cat = classify(text)
+    if not cat:
+        return "not important", None
+    try:
+        # Tweets rarely name their zone; label Japanese-account times JST (same UTC+9 as KST).
+        handle = HANDLE_RE.search(entry.get("link") or "")
+        default_tz = "JST" if handle and handle.group(1).upper().endswith("_JP") else None
+        tz_label, times = parse_times(text, entry_time(entry), default_tz)
+    except Exception as e:  # odd date text must never block the post itself
+        print(f"time parse failed {eid}: {type(e).__name__}: {e}")
+        tz_label, times = SOURCE_TZ, []
+    fp = "text:" + content_fingerprint(text)
+    wk = window_key(cat, times, text)
+    if is_repeat(state, fp, eid) or is_repeat(state, wk, eid):
+        return "duplicate/reminder", None
+    payload = build_payload(cat, entry, text, tz_label, times, source)
+    return "post", {"cat": cat, "times": times, "fp": fp, "wk": wk, "payload": payload}
+
+
+def preview(state, items):
+    """PREVIEW=1: show what the newest tweets of each feed would post as. Posts and saves nothing."""
+    print(f"PREVIEW: newest {PREVIEW_PER_FEED} tweets per feed; nothing is posted or saved")
+    shown = {}
+    for entry, source, _, n in reversed(items):  # newest first
+        if shown.get(n, 0) >= PREVIEW_PER_FEED:
+            continue
+        shown[n] = shown.get(n, 0) + 1
+        verdict, info = decide(entry, source, state)
+        what = f"would post {info['cat']['key']}" if info else f"skip ({verdict})"
+        print(f"\n=== feed {n} · {tweet_key(entry)} · {what}")
+        print("fields:", ", ".join(sorted(entry.keys())))
+        print("html:", html_skeleton(entry.get("summary") or ""))
+        if info:
+            deliver(info["payload"])  # prints, doesn't post
 
 
 def main():
-    if not FEED_URLS or not WEBHOOK:
+    if not FEED_URLS or not (WEBHOOK or PREVIEW):
         sys.exit("Set FEED_URL and DISCORD_WEBHOOK_URL")
 
     state = load_state()
@@ -402,13 +542,15 @@ def main():
         state["feeds"] = [feed_key(FEED_URLS[0])]
     state = state or {"ids": [], "recent": {}, "feeds": [], "schema": 2}
 
-    items, failures = fetch_feeds(state)
+    items, failures, statuses = fetch_feeds(state)
+    if PREVIEW:
+        return preview(state, items)
     if not items:
         sys.exit("Feed error: no feed could be read")  # don't touch state on a bad fetch
     seen_ids = set(state["ids"])
-    now = datetime.now(ZoneInfo("UTC")).timestamp()
+    now = now_ts()
 
-    for entry, source, is_new_feed in items:
+    for entry, source, is_new_feed, _ in items:
         eid = tweet_key(entry)
         if eid in seen_ids:
             continue
@@ -422,40 +564,23 @@ def main():
             print(f"skipped (too old) {eid}")
             continue
 
-        text = clean(entry.get("summary") or entry.get("title", ""))
-        cat = classify(text)
-        if not cat:
-            print(f"skipped (not important) {eid}")
+        verdict, info = decide(entry, source, state)
+        if not info:
+            print(f"skipped ({verdict}) {eid}")
             continue
-
         try:
-            # Tweets rarely name their zone; label Japanese-account times JST (same UTC+9 as KST).
-            handle = HANDLE_RE.search(entry.get("link") or "")
-            default_tz = "JST" if handle and handle.group(1).upper().endswith("_JP") else None
-            tz_label, times = parse_times(text, published, default_tz)
-        except Exception as e:  # odd date text must never block the post itself
-            print(f"time parse failed {eid}: {type(e).__name__}: {e}")
-            tz_label, times = SOURCE_TZ, []
-
-        fp = "text:" + content_fingerprint(text)
-        wk = window_key(cat, times, text)
-        if is_repeat(state, fp, eid) or is_repeat(state, wk, eid):
-            print(f"skipped (duplicate/reminder) {eid}")
-            continue
-
-        try:
-            post(build_payload(cat, entry, text, tz_label, times, source))
+            deliver(info["payload"])
         except PostError as e:
             # Not marked as seen, so it is retried next run instead of being lost.
             state["ids"].remove(eid)
             print(f"post failed {eid}: {e}")
             failures += 1
             continue
-        state["recent"][fp] = {"t": now, "id": eid}
-        if wk:
-            state["recent"][wk] = {"t": now, "id": eid}
+        state["recent"][info["fp"]] = {"t": now, "id": eid}
+        if info["wk"]:
+            state["recent"][info["wk"]] = {"t": now, "id": eid}
         save_state(state)  # save after every post, so a crash can't cause reposts
-        print(f"posted {cat['key']} {eid} ({len(times)} times)")
+        print(f"posted {info['cat']['key']} {eid} ({len(info['times'])} times)")
     save_state(state)
     if failures:
         sys.exit(f"{failures} feed/post error(s) above; failed posts are retried next run")  # run shows red

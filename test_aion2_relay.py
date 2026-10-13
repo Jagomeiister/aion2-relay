@@ -1,6 +1,7 @@
 """Regression tests for aion2_maint_relay.py. Run: python -m pytest -q"""
 import json
 import os
+import time
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -146,15 +147,31 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(r, "post", fake_post)
     monkeypatch.setattr(r, "MAX_AGE_HOURS", 10**6)  # fixture dates are fixed, not relative to now
     feeds = {FEED_A: feed}  # url -> entries (oldest first); missing url = feed down
+    problems = {}  # url -> problem text reported while that feed is down
     monkeypatch.setattr(r, "FEED_URLS", [FEED_A])
 
-    def fake_parse(url):
-        entries = list(reversed(feeds.get(url, [])))  # feedparser returns newest first
-        return SimpleNamespace(entries=entries, bozo=0, feed={"title": f"src {url[-5:]}"},
-                               get=lambda k, d=None: 200 if entries else 404)
+    def fake_fetch(url):
+        entries = feeds.get(url)
+        if not entries:
+            return None, problems.get(url, "HTTP 404")
+        # feedparser returns newest first
+        return SimpleNamespace(entries=list(reversed(entries)), feed={"title": f"src {url[-5:]}"}), None
 
-    monkeypatch.setattr(r.feedparser, "parse", fake_parse)
-    return SimpleNamespace(state=state, sent=sent, feed=feed, fail=fail, feeds=feeds)
+    monkeypatch.setattr(r, "fetch_feed", fake_fetch)
+    clock = {"now": None}  # None = real time
+    monkeypatch.setattr(r, "now_ts", lambda: clock["now"] if clock["now"] is not None else time.time())
+    return SimpleNamespace(state=state, sent=sent, feed=feed, fail=fail, feeds=feeds,
+                           problems=problems, clock=clock)
+
+
+@pytest.fixture(autouse=True)
+def isolate(monkeypatch):
+    """No role ping, no preview and no real sleeping unless a test asks for it."""
+    monkeypatch.setattr(r, "ROLE_ID", "")
+    monkeypatch.setattr(r, "PREVIEW", False)
+    slept = []
+    monkeypatch.setattr(r, "sleep", slept.append)
+    return slept
 
 
 FEED_A = "https://rss.app/feeds/AAAAsecretA.xml"
@@ -424,3 +441,148 @@ def test_real_maintenance_notices_still_match(text):
 
 def test_after_maintenance_patch_notes_are_an_update():
     assert r.classify("Patch notes will be released after the maintenance.")["key"] == "update"
+
+
+# --- feed fetching and Discord rate limits ---------------------------------
+
+RSS = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>AION2 (@AION2_JP) / Twitter</title>
+<item><title>x</title><link>https://x.com/AION2_JP/status/1</link><description>hi</description></item>
+</channel></rss>"""
+
+
+class Resp:
+    def __init__(self, status=200, content=b"", headers=None, json_data=None):
+        self.status_code, self.content, self.headers, self._json = status, content, headers or {}, json_data
+        self.text = ""
+
+    def json(self):
+        if self._json is None:
+            raise ValueError("no json")
+        return self._json
+
+
+def scripted(monkeypatch, name, *outcomes):
+    """Patch requests.<name> to return/raise the given outcomes in order; returns the call log."""
+    calls, queue = [], list(outcomes)
+
+    def fake(*args, **kwargs):
+        calls.append((args, kwargs))
+        out = queue.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    monkeypatch.setattr(r.requests, name, fake)
+    return calls
+
+
+def test_fetch_feed_timeout_and_user_agent(monkeypatch):
+    calls = scripted(monkeypatch, "get", Resp(200, RSS))
+    feed, problem = r.fetch_feed(FEED_A)
+    assert problem is None and len(feed.entries) == 1
+    kwargs = calls[0][1]
+    assert kwargs["timeout"] == (5, 20) and "aion2-relay" in kwargs["headers"]["User-Agent"]
+
+
+def test_fetch_feed_retries_once_on_connection_error(monkeypatch, isolate):
+    calls = scripted(monkeypatch, "get", requests.ConnectionError("boom"), Resp(200, RSS))
+    feed, problem = r.fetch_feed(FEED_A)
+    assert problem is None and len(calls) == 2 and isolate == [3]
+
+
+def test_fetch_feed_retries_once_on_5xx(monkeypatch):
+    calls = scripted(monkeypatch, "get", Resp(503), Resp(200, RSS))
+    assert r.fetch_feed(FEED_A)[1] is None and len(calls) == 2
+
+
+def test_fetch_feed_404_not_retried(monkeypatch):
+    calls = scripted(monkeypatch, "get", Resp(404))
+    assert r.fetch_feed(FEED_A) == (None, "HTTP 404") and len(calls) == 1
+
+
+def test_fetch_feed_empty_is_an_error(monkeypatch):
+    scripted(monkeypatch, "get", Resp(200, b"<rss><channel></channel></rss>"))
+    feed, problem = r.fetch_feed(FEED_A)
+    assert feed is None and problem
+
+
+def test_fetch_errors_never_contain_url(monkeypatch):
+    err = requests.ConnectionError(f"Max retries exceeded with url: {FEED_A}")
+    scripted(monkeypatch, "get", err, err)
+    feed, problem = r.fetch_feed(FEED_A)
+    assert feed is None and problem == "ConnectionError" and "secret" not in problem
+
+
+def test_post_429_waits_retry_after_header(monkeypatch, isolate):
+    calls = scripted(monkeypatch, "post", Resp(429, headers={"Retry-After": "2"}), Resp(204))
+    r.post({})
+    assert len(calls) == 2 and isolate == [2.0]
+
+
+def test_post_429_json_retry_after(monkeypatch, isolate):
+    scripted(monkeypatch, "post", Resp(429, json_data={"retry_after": 1.5}), Resp(204))
+    r.post({})
+    assert isolate == [1.5]
+
+
+def test_post_429_long_wait_gives_up_without_sleeping(monkeypatch, isolate):
+    scripted(monkeypatch, "post", Resp(429, headers={"Retry-After": "60"}))
+    with pytest.raises(r.PostError) as e:
+        r.post({})
+    assert e.value.status == 429 and isolate == []
+
+
+def test_post_429_three_times_gives_up(monkeypatch, isolate):
+    scripted(monkeypatch, "post", *[Resp(429, headers={"Retry-After": "1"})] * 3)
+    with pytest.raises(r.PostError) as e:
+        r.post({})
+    assert e.value.status == 429 and isolate == [1.0, 1.0]
+
+
+# --- preview mode -----------------------------------------------------------
+
+def test_preview_posts_and_saves_nothing(harness, monkeypatch, capsys):
+    h = harness
+    h.feed += [at(1, "hi", 5), at(2, "Maintenance 10/9 10:00 ~ 14:00 KST", 4)]
+    r.main()  # baseline: both seen
+    before = h.state.read_bytes()
+    h.feed += [at(i, f"Patch notes {i}", 2 - i / 10) for i in range(3, 8)]  # 7 is newest
+    monkeypatch.setattr(r, "PREVIEW", True)
+    capsys.readouterr()
+    r.main()
+    out = capsys.readouterr().out
+    assert h.sent == [] and h.state.read_bytes() == before
+    assert out.count("=== feed 1") == 3                     # newest 3 only
+    assert "would post update" in out and '"embeds"' in out
+    assert "=== feed 1 · 7 ·" in out                        # newest first
+
+
+def test_preview_shows_already_posted_tweets(harness, monkeypatch, capsys):
+    h = harness
+    h.feed.append(at(1, "hi", 5))
+    r.main()
+    h.feed.append(at(2, "Patch notes are live", 1))
+    r.main()  # really posted
+    assert len(h.sent) == 1
+    monkeypatch.setattr(r, "PREVIEW", True)
+    capsys.readouterr()
+    r.main()
+    assert "would post update" in capsys.readouterr().out and len(h.sent) == 1
+
+
+def test_preview_redacts_secrets(harness, monkeypatch, capsys):
+    h = harness
+    h.feed.append(at(1, f"Patch notes https://rss.app/feeds/xyz.xml and {FEED_A}", 1))
+    monkeypatch.setattr(r, "PREVIEW", True)
+    r.main()
+    out = capsys.readouterr().out
+    assert "rss.app/feeds" not in out and "secretA" not in out
+    assert "[rss.app URL]" in out
+
+
+def test_preview_without_webhook(harness, monkeypatch, capsys):
+    harness.feed.append(at(1, "Patch notes", 1))
+    monkeypatch.setattr(r, "PREVIEW", True)
+    monkeypatch.setattr(r, "WEBHOOK", None)
+    r.main()
+    assert "would post update" in capsys.readouterr().out
