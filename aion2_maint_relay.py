@@ -292,6 +292,7 @@ def load_state():
         data = {"ids": data}
     data.setdefault("ids", [])
     data.setdefault("recent", {})  # fingerprint/window -> unix time first posted
+    data.setdefault("schema", 2)  # state format version (its first write also proves git push works)
     return data
 
 
@@ -399,7 +400,7 @@ def main():
     if state is not None and "feeds" not in state:
         # State from before multi-feed support: the single feed back then was FEED_URL's first line.
         state["feeds"] = [feed_key(FEED_URLS[0])]
-    state = state or {"ids": [], "recent": {}, "feeds": []}
+    state = state or {"ids": [], "recent": {}, "feeds": [], "schema": 2}
 
     items, failures = fetch_feeds(state)
     if not items:

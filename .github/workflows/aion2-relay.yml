@@ -19,13 +19,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Latest branch state, not the commit from when this run was triggered. A run queued
           # behind another would otherwise load stale aion2_seen.json and repost its tweets.
           ref: ${{ github.ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
           cache: pip
@@ -51,5 +51,11 @@ jobs:
           git add aion2_seen.json
           git diff --cached --quiet && { echo "No new posts"; exit 0; }
           git commit -m "Update seen posts [skip ci]"
-          git pull --rebase -X theirs   # in case you edited aion2_seen.json mid-run
-          git push
+          # Retry: a push landing between our pull and push (e.g. a code change) would otherwise
+          # lose this run's state, and the next run would repost its tweets. -X theirs keeps
+          # this run's aion2_seen.json if you edited it mid-run.
+          for i in 1 2 3; do
+            git pull --rebase -X theirs && git push && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
