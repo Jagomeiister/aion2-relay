@@ -594,3 +594,129 @@ def test_preview_shows_text_of_skipped_tweets(harness, monkeypatch, capsys):
     r.main()
     out = capsys.readouterr().out
     assert "skip (not important)" in out and 'text: "Fan art Friday!"' in out
+
+
+# --- step D: classification, quotes, statuses and zones (real rss.app tweets) ---------------
+
+CORPUS = json.load(open(os.path.join(os.path.dirname(__file__), "test_data", "rssapp_corpus.json"),
+                        encoding="utf-8"))
+BNE = ZoneInfo("Australia/Brisbane")
+JP_SOURCE, GL_SOURCE = "AION2 (@AION2_JP) / Twitter", "AION 2 (@AION2Official) / Twitter"
+
+
+def snowflake_time(tweet_id):
+    return datetime.fromtimestamp(((int(tweet_id) >> 22) + 1288834974657) / 1000, UTC)
+
+
+def feed_entry(link, text, published=None):
+    published = published or snowflake_time(TWEET_ID.search(link).group(1))
+    return r.feedparser.FeedParserDict(link=link, summary=text, published_parsed=published.timetuple())
+
+
+TWEET_ID = __import__("re").compile(r"/status/(\d+)")
+
+
+def fresh_state():
+    return {"ids": [], "recent": {}, "feeds": []}
+
+
+def verdict_of(entry, source):
+    verdict, info = r.decide(entry, source, fresh_state())
+    if verdict != "post":
+        return verdict, info, []
+    kind = info["cat"]["key"] + (f"/{info['status']}" if info["status"] else "")
+    spans = [r.fmt_span(s.astimezone(BNE), e.astimezone(BNE) if e else None) for s, e in info["times"]]
+    return kind, info, spans
+
+
+@pytest.mark.parametrize("rec", CORPUS, ids=[c["id"] for c in CORPUS])
+def test_rssapp_corpus(rec):
+    """97 real rss.app tweets (both accounts, Jun-Oct 2026) with reviewed verdicts and Brisbane times."""
+    kind, _, spans = verdict_of(feed_entry(rec["link"], rec["text"]), rec["source"])
+    assert (kind, spans) == (rec["expected"], rec["brisbane"])
+
+
+def test_trailer_date_is_not_the_tweet_date():
+    # Published 23:30 UTC on Oct 9 = Oct 10 in Japan; the embed trailer still says "Oct 9".
+    e = feed_entry("https://x.com/AION2_JP/status/1", "Emergency maintenance today from 19:45\n\n #AION2— AION2 (@AION2_JP)Oct 9, 2026",
+                   datetime(2026, 10, 9, 23, 30, tzinfo=UTC))
+    kind, _, spans = verdict_of(e, JP_SOURCE)
+    assert kind == "maintenance" and spans == ["Sat 10 Oct 8:45 pm"]
+
+
+def test_same_text_on_another_day_is_still_a_duplicate():
+    state = fresh_state()
+    first = feed_entry("https://x.com/AION2_JP/status/1", "Patch notes are live\n\n — AION2 (@AION2_JP)Oct 9, 2026")
+    again = feed_entry("https://x.com/AION2_JP/status/2", "Patch notes are live\n\n — AION2 (@AION2_JP)Oct 10, 2026")
+    verdict, info = r.decide(first, JP_SOURCE, state)
+    state["recent"][info["fp"]] = {"t": 0, "id": "1"}
+    assert r.decide(again, JP_SOURCE, state)[0] == "duplicate/reminder"
+
+
+def test_split_quote():
+    text = ("Hello, Daevas! Server Transfer Q&A\n\nLearn more here:  store.steampowered.com/news/…AION 2 (@AION2Official)"
+            "Server transfers will be available starting on October 14th\n\nLearn more:  aion2.plaync.com/en-us/board…"
+            "—  https://x.com/AION2Official/status/2105328638367605138")
+    own, quote, url = r.split_quote(text, "AION 2")
+    assert own == "Hello, Daevas! Server Transfer Q&A\n\nLearn more here:  store.steampowered.com/news/…"
+    assert quote.startswith("Server transfers will be available") and quote.endswith("board…")
+    assert url == "https://x.com/AION2Official/status/2105328638367605138"
+    assert r.split_quote("No quote here", "AION 2") == ("No quote here", "", None)
+
+
+def test_quote_shows_as_block_quote_and_its_times_are_not_used():
+    rec = next(c for c in CORPUS if c["id"] == "2108467686644781299")  # "maintenance complete", quoting the notice
+    kind, info, spans = verdict_of(feed_entry(rec["link"], rec["text"]), rec["source"])
+    desc = info["payload"]["embeds"][0]["description"]
+    assert "> ↪ [Quoted post](https://x.com/AION2_JP/status/2108181948137185376)" in desc
+    assert "#Aion2AION2" not in desc and spans == ["Fri 9 Oct 6:00 pm"]
+
+
+def test_retweet_of_a_fan_is_skipped():
+    e = feed_entry("https://x.com/somefan/status/2109000000000000000", "Got the event mount! #AION2— @somefan Oct 12, 2026")
+    assert r.decide(e, GL_SOURCE, fresh_state())[0] == "retweet"
+
+
+def test_free_pet_loot_drop_is_an_event():
+    text = ("🪽Exclusive loot drop🪽\n\nCreators have been battling it out in Atreia  and Series 2 unlocked a new "
+            "wave of in-game rewards, including a FREE PET!⚔️\n\n*Bound items are non-tradable.\n#AION2 #AION2Global")
+    assert r.classify(text)["key"] == "event"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Join live on Twitch October 9 @ 1:00 PM PT / 22:00 CET", ["Sat 10 Oct 6:00 am"]),
+    ("Join live on Twitch Mon, October 12 · 9:00 AM PT / 18:00 CEST", ["Tue 13 Oct 2:00 am"]),
+    ("When: October 6, 2026 at 23:30 PDT / October 7, 2026 at 08:30 CEST", ["Wed 7 Oct 4:30 pm"]),
+    ("Maintenance 10/9 10:00 KST - 14:00 KST", ["Fri 9 Oct 11:00 am – 3:00 pm"]),
+])
+def test_each_time_uses_its_own_zone(text, expected):
+    _, ts = r.parse_times(text, datetime(2026, 10, 8, tzinfo=UTC))
+    assert [r.fmt_span(s.astimezone(BNE), e.astimezone(BNE) if e else None) for s, e in ts] == expected
+
+
+def test_short_zone_names_need_capitals():
+    assert r.parse_times("Opt in at 10:00 pt", PUB)[0] == "KST"
+
+
+@pytest.mark.parametrize("text,status", [
+    ("Maintenance has been extended to 16:00 KST", "extended"),
+    ("Extended Maintenance notice: 10/9 10:00-16:00 KST", None),
+    ("Maintenance notice 10/9 10:00 KST. Once maintenance has ended, servers will reopen.", None),
+    ("The maintenance has been postponed to October 15", "rescheduled"),
+    ("Maintenance has been completed. Servers are now open!", "complete"),
+    ("Maintenance will end early, at 15:00 KST", "early"),
+    ("Today's maintenance is cancelled", "cancelled"),
+])
+def test_maintenance_status(text, status):
+    assert r.maint_status(r.classify(text), text) == status
+
+
+@pytest.mark.parametrize("text,title", [
+    ("Maintenance has been completed. Servers are now open!", "✅ Maintenance complete — servers are back"),
+    ("Maintenance will end early, at 15:00 KST", "⏩ Maintenance ending early"),
+    ("Maintenance has been extended to 16:00 KST", "⏳ Maintenance extended"),
+])
+def test_status_posts_never_ping(monkeypatch, text, title):
+    monkeypatch.setattr(r, "ROLE_ID", "987654321")
+    p = r.build_payload(r.classify(text), {"link": ""}, text, "KST", [])
+    assert p["embeds"][0]["title"] == title and "content" not in p

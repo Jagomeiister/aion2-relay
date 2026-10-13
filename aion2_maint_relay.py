@@ -64,7 +64,10 @@ CATEGORIES = [
         "pattern": re.compile(
             r"\bevents?\b|festival|celebrat|campaign|login reward|log-?in bonus|attendance|double (xp|exp|drop)|"
             r"limited[- ]time|giveaway|giv(?:e|es|ing) away|\bgifts?\b|livestream|live stream|coupon|redeem|"
-            r"이벤트|출석|쿠폰|방송|선물|イベント|キャンペーン|配信|プレゼント|配布|ログインボーナス", re.I),
+            r"loot drop|\brewards?\b|present items?|"
+            # "FREE OUTFIT", "free pet"; not "first move is free" (a transfer) or "Play on Steam for free" (an ad)
+            r"\bfree\s+(?:\w+\s+)?(?:pets?|outfits?|costumes?|skins?|mounts?|items?|tickets?|gifts?|rewards?|wings?)\b|"
+            r"이벤트|출석|쿠폰|방송|선물|무료|보상|イベント|キャンペーン|配信|プレゼント|配布|ログインボーナス|無料", re.I),
         "title": "🎉 Upcoming event",
         "color": 0x2ECC71,
         "ping": False,
@@ -73,7 +76,10 @@ CATEGORIES = [
         "key": "update",
         "pattern": re.compile(
             r"patch notes?|\bupdate\b|new (season|class|dungeon|zone|content)|season \d|"
-            r"업데이트|패치|시즌|アップデート|パッチ", re.I),
+            r"\bserver\s+(?:transfers?|moves?|migrations?)\b|\bnew servers?\b|\bmatching servers?\b|"
+            r"\baddition of (?:new )?servers?\b|\badd(?:s|ing|ed)?\s+(?:new\s+)?servers?\b|\bservers?\s+(?:addition|expansion)\b|"
+            r"업데이트|패치|시즌|서버\s*(?:이전|이동|추가|증설)|"
+            r"アップデート|パッチ|サーバー(?:移動|移転|追加|増設)|マッチングサーバー|キャラクター移動", re.I),
         "title": "📜 Game update",
         "color": 0x3498DB,
         "ping": False,
@@ -104,6 +110,88 @@ def classify(text: str):
         if cat["key"] in ENABLED and cat["pattern"].search(text):
             return cat
     return None
+
+
+# "Events" that are really region-only promotions: social-media prize draws, shop and café
+# tie-ins, real-world collaborations. Only the opening lines are checked, so a round-up of in-game
+# events that lists one such campaign further down still posts. Never applied to maintenance/updates.
+PROMO_RE = re.compile(
+    r"follow\s*(?:&|and|＆)\s*re(?:post|tweet)|phorolipo|lottery|prize draw|\bwinners?\b|gift card|\bamazon\b|"
+    r"\d[\d,]*\s*yen\b|wishlist|\bmerch(?:andise)?\b|\bgoods\b|\b(?:pc|game|partner)\s+shops?\b|"
+    r"facilit(?:y|ies)|nationwide|\bbung(?:ee|y)\b|caf[eé]s?\b|highlight video|already ended|"
+    r"抽選|当選|フォロー|リポスト|フォロリポ|グッズ|店舗|カフェ|全国|ギフト券|円分|추첨|당첨|팔로우|굿즈",
+    re.I)
+PROMO_HEAD_LINES = 5
+
+
+def is_promo(text: str) -> bool:
+    head = [line for line in text.splitlines() if line.strip()][:PROMO_HEAD_LINES]
+    return bool(PROMO_RE.search("\n".join(head)))
+
+
+# What a maintenance tweet says about the maintenance, checked in this order. A plain announcement
+# (none of these) is the red "servers going down" post: the only kind that pings.
+CANCEL_RE = re.compile(r"cancel|call(ed)? off|취소|중지|中止|キャンセル", re.I)
+COMPLETE_RE = re.compile(
+    r"\bhas (?:been )?(?:completed|finished|ended)\b|\b(?:is|are) now (?:complete|over|open|online|back)\b|"
+    r"\bservers? (?:is|are|has|have) (?:now )?(?:re)?opened?\b|"
+    r"終了しました|完了しました|終了いたしました|完了いたしました|종료되었습니다|완료되었습니다", re.I)
+EARLY_RE = re.compile(
+    r"\bearly end\b|\bend(?:s|ed|ing)? early\b|\bearlier than (?:planned|scheduled|announced|originally)|"
+    r"早期終了|前倒し|조기\s*종료", re.I)
+EXTEND_RE = re.compile(  # a change ("has been extended to 16:00"), not an "Extended Maintenance" notice
+    r"\b(?:has|have) been extended\b|\b(?:will be|is being) extended\b|\bextended (?:to|until|by)\b|"
+    r"\bextension of\b|延長(?:いた)?し(?:ます|ました)|延長となり|연장(?:됩니다|되었습니다|합니다)", re.I)
+RESCHEDULE_RE = re.compile(
+    r"\bpostpone[ds]?\b|\breschedule[ds]?\b|\bdelayed\b|延期|日程(?:を)?変更|연기|일정\s*변경", re.I)
+MAINT_STATUS = [  # (status, pattern, title, colour)
+    ("cancelled", CANCEL_RE, "✅ Maintenance cancelled", 0xF1C40F),
+    ("complete", COMPLETE_RE, "✅ Maintenance complete — servers are back", 0x2ECC71),
+    ("early", EARLY_RE, "⏩ Maintenance ending early", 0x2ECC71),
+    ("extended", EXTEND_RE, "⏳ Maintenance extended", 0xE67E22),
+    ("rescheduled", RESCHEDULE_RE, "📅 Maintenance rescheduled", 0xE67E22),
+]
+# "Once maintenance has ended, ..." describes the future, not what happened.
+CONDITIONAL_RE = re.compile(r"\b(?:once|after|when|until|before|if)\b[^.!?\n]{0,30}$", re.I)
+
+
+def says(rx, text: str) -> bool:
+    """rx matches somewhere that isn't inside a "once/after/when ..." clause."""
+    return any(not CONDITIONAL_RE.search(text[max(0, m.start() - 40):m.start()]) for m in rx.finditer(text))
+
+
+def maint_status(cat, text: str):
+    """The MAINT_STATUS key a maintenance tweet announces, or None for a plain announcement."""
+    if cat["key"] != "maintenance":
+        return None
+    return next((key for key, rx, _, _ in MAINT_STATUS if says(rx, text)), None)
+
+
+# rss.app renders tweets as X embeds. A trailer ends the text: "— AION2 (@AION2_JP)Oct 9, 2026"
+# (or "— @fan Oct 9, 2026" on a retweet). A quoted tweet is glued in as
+# "...#Aion2AION2 (@AION2_JP)<quoted text>— https://x.com/AION2_JP/status/<id>—".
+TRAILER_RE = re.compile(
+    r"\s*—\s*(?:[^\n—]{0,60}?\(@\w{1,15}\)|@\w{1,15})\s*[A-Z][a-z]{2,8}\.? \d{1,2}, \d{4}\s*$")
+QUOTE_END_RE = re.compile(r"—\s*(https?://(?:x|twitter)\.com/(\w{1,15})/status/\d+)\s*—?\s*$")
+
+
+def feed_identity(source: str):
+    """("AION2", "AION2_JP") from a feed title like "AION2 (@AION2_JP) / Twitter"; ("", "") if absent."""
+    m = re.match(r"\s*(.*?)\s*\(@(\w{1,15})\)", source or "")
+    return (m.group(1), m.group(2)) if m else ("", "")
+
+
+def split_quote(text: str, own_name: str = ""):
+    """(the tweet's own text, quoted tweet text, quoted tweet URL); "" and None without a quote."""
+    m = QUOTE_END_RE.search(text)
+    head = text.rfind(f"(@{m.group(2)})", 0, m.start()) if m else -1
+    if head < 0:
+        return text, "", None
+    own = text[:head].rstrip()
+    if own_name and own.endswith(own_name):  # the quoted author's name is glued on: "#Aion2AION2"
+        own = own[: -len(own_name)].rstrip()
+    quote = text[head + len(m.group(2)) + 3 : m.start()].strip()
+    return own, quote, m.group(1)
 
 TZ_ALIASES = {
     "KST": "Asia/Seoul",
@@ -138,6 +226,10 @@ NAME_DM_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+" + MONTH_NAME + r"(?:,?
 TIME_RE = re.compile(r"(?<![\d:])([01]?\d|2[0-4]):([0-5]\d)(?![\d:])(?:\s*([ap])\.?m\b\.?)?", re.I)
 TZ_RE = re.compile(
     r"\b(?:UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?([0-5]\d))?|\b(" + "|".join(TZ_ALIASES) + r")\b", re.I)
+# Generic US zones ("1:00 PM PT"); capitals only, so they can't match inside ordinary words.
+SHORT_TZ = {"PT": "America/Los_Angeles", "ET": "America/New_York", "CT": "America/Chicago"}
+SHORT_TZ_RE = re.compile(r"\b(PT|ET|CT)\b")
+NEXT_TO_TIME_RE = re.compile(r"[\s(（]*")  # what may sit between a time and its zone: "10:00 (KST)"
 
 
 def clean(text: str) -> str:
@@ -146,14 +238,20 @@ def clean(text: str) -> str:
     return html.unescape(text).strip()
 
 
-def find_date(text: str, ref: date) -> date | None:
-    """First valid date in the text. Invalid matches ("Season 2-30") are skipped, not fatal."""
+def find_dates(text: str, ref: date):
+    """[(start, end, date)] for every valid date in the text, in order. Invalid matches
+    ("Season 2-30") are skipped, not fatal."""
     found = []
     for rx in (NUM_DATE_RE, CJK_DATE_RE):
-        found += [(m.start(), m.group(1), m.group(2), m.group(3)) for m in rx.finditer(text)]
-    found += [(m.start(), m.group(3), MONTHS[m.group(1)[:3].lower()], m.group(2)) for m in NAME_MD_RE.finditer(text)]
-    found += [(m.start(), m.group(3), MONTHS[m.group(2)[:3].lower()], m.group(1)) for m in NAME_DM_RE.finditer(text)]
-    for _, year, month, day in sorted(found, key=lambda f: f[0]):
+        found += [(m.start(), m.end(), m.group(1), m.group(2), m.group(3)) for m in rx.finditer(text)]
+    found += [(m.start(), m.end(), m.group(3), MONTHS[m.group(1)[:3].lower()], m.group(2))
+              for m in NAME_MD_RE.finditer(text)]
+    found += [(m.start(), m.end(), m.group(3), MONTHS[m.group(2)[:3].lower()], m.group(1))
+              for m in NAME_DM_RE.finditer(text)]
+    out, taken_until = [], -1
+    for start, end, year, month, day in sorted(found, key=lambda f: (f[0], -f[1])):
+        if start < taken_until:
+            continue  # overlaps a date already found
         try:
             d = date(int(year) if year else ref.year, int(month), int(day))
             if not year:  # no year given: pick the one nearest the tweet (Dec tweet about "1/5")
@@ -163,8 +261,38 @@ def find_date(text: str, ref: date) -> date | None:
                     d = d.replace(year=d.year - 1)
         except ValueError:
             continue
-        return d
-    return None
+        out.append((start, end, d))
+        taken_until = end
+    return out
+
+
+def find_date(text: str, ref: date) -> date | None:
+    """First valid date in the text."""
+    dates = find_dates(text, ref)
+    return dates[0][2] if dates else None
+
+
+def zone_tokens(text: str):
+    """[(start, end, tzinfo, label)] for every time zone named in the text, in order."""
+    out = []
+    for m in TZ_RE.finditer(text):
+        if m.group(1):  # explicit offset, e.g. "(UTC+9)"
+            offset = timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0))
+            label = f"UTC{m.group(1)}{int(m.group(2))}" + (f":{m.group(3)}" if m.group(3) else "")
+            out.append((m.start(), m.end(), timezone(offset if m.group(1) == "+" else -offset, label), label))
+        else:
+            label = m.group(4).upper()
+            out.append((m.start(), m.end(), ZoneInfo(TZ_ALIASES[label]), label))
+    out += [(m.start(), m.end(), ZoneInfo(SHORT_TZ[m.group(1)]), m.group(1)) for m in SHORT_TZ_RE.finditer(text)]
+    return sorted(out, key=lambda z: z[0])
+
+
+def blank(text: str, spans) -> str:
+    """Overwrite the given (start, end) spans with spaces, keeping every other position."""
+    chars = list(text)
+    for a, b in spans:
+        chars[a:b] = " " * (b - a)
+    return "".join(chars)
 
 
 # What may sit between two times for them to count as one range: "19:45-20:45", "10:00 ~ 14:00",
@@ -173,50 +301,64 @@ RANGE_GAP_RE = re.compile(r"\s*(?:-|–|—|~|～|〜|to|until|till|から|부�
 
 
 def parse_times(text: str, published: datetime | None, default_tz: str | None = None):
-    """Return (tz_label, [(start, end or None)]) for times found in the post, repeats removed."""
-    m = TZ_RE.search(text)
-    if m and m.group(1):  # explicit offset, e.g. "(UTC+9)"
-        offset = timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0))
-        tz_label = f"UTC{m.group(1)}{int(m.group(2))}" + (f":{m.group(3)}" if m.group(3) else "")
-        src = timezone(offset if m.group(1) == "+" else -offset, tz_label)
+    """Return (zone label, [(start, end or None)]) for the times in a post, repeats removed.
+    Each time uses the zone written right after it ("1:00 PM PT / 22:00 CET"), else the post's
+    first zone, else default_tz/SOURCE_TZ; and the nearest date written before it."""
+    zones = zone_tokens(text)
+    if zones:
+        dflt_tz, dflt_label = zones[0][2], zones[0][3]
     else:
-        tz_label = m.group(4).upper() if m else (default_tz or SOURCE_TZ)
-        src = ZoneInfo(TZ_ALIASES.get(tz_label, "Asia/Seoul"))
+        dflt_label = default_tz or SOURCE_TZ
+        dflt_tz = ZoneInfo(TZ_ALIASES.get(dflt_label, "Asia/Seoul"))
+    published = published or datetime.now(timezone.utc)
+    dates = find_dates(text, published.astimezone(dflt_tz).date())
 
-    ref = (published or datetime.now(src)).astimezone(src)
-    d = find_date(text, ref.date()) or ref.date()
-    base = datetime(d.year, d.month, d.day, tzinfo=src)
+    plain = blank(text, [z[:2] for z in zones])           # "+09:00" in "UTC+09:00" isn't a time
+    gaps = blank(plain, [d[:2] for d in dates])           # "Oct 9 22:00 - Oct 10 02:00" is a range
 
-    plain = TZ_RE.sub(lambda t: " " * len(t.group()), text)  # blank "+09:00" offsets, keep positions
-    found = []  # (match, datetime)
+    tokens = []
     for t in TIME_RE.finditer(plain):
         hh, mm, ampm = t.groups()
         h = int(hh)
         if ampm:
             h = h % 12 + (12 if ampm.lower() == "p" else 0)
-        found.append((t, base + timedelta(hours=h, minutes=int(mm))))
+        zone = next((z for z in zones if z[0] >= t.end() and NEXT_TO_TIME_RE.fullmatch(text[t.end():z[0]])), None)
+        before = [d for _, end, d in dates if end <= t.start()]
+        day = before[-1] if before else (dates[0][2] if dates else None)
+        tokens.append((t, h * 60 + int(mm), zone, day))
+
+    def instant(token, zone):
+        _, minutes, _, day = token
+        tz, label = (zone[2], zone[3]) if zone else (dflt_tz, dflt_label)
+        day = day or published.astimezone(tz).date()
+        return datetime(day.year, day.month, day.day, tzinfo=tz) + timedelta(minutes=minutes), label
 
     ranges, i = [], 0
-    while i < len(found):
-        (m1, start), nxt = found[i], found[i + 1] if i + 1 < len(found) else None
-        if nxt and RANGE_GAP_RE.fullmatch(plain[m1.end():nxt[0].start()]):
-            end = nxt[1]
+    while i < len(tokens):
+        t1, t2 = tokens[i], tokens[i + 1] if i + 1 < len(tokens) else None
+        if t2 and RANGE_GAP_RE.fullmatch(gaps[t1[0].end():t2[0].start()]):
+            zone = t1[2] or t2[2]  # "10:00 - 14:00 KST": the zone covers both ends
+            start, label = instant(t1, t1[2] or zone)
+            end, _ = instant(t2, t2[2] or zone)
             if end <= start:  # e.g. 22:00 ~ 02:00 rolls past midnight
                 end += timedelta(days=1)
-            ranges.append((start, end))
+            ranges.append((start, end, label))
             i += 2
         else:
-            ranges.append((start, None))
+            start, label = instant(t1, t1[2])
+            ranges.append((start, None, label))
             i += 1
 
-    # Quoted/repeated tweets mention the same time again: drop exact repeats, and a lone
-    # time that is just the start of a range already listed ("19:45" + "19:45-20:45").
-    range_starts = {s for s, e in ranges if e}
-    results = []
-    for s, e in ranges:
+    # Quoted/repeated tweets mention the same time again: drop exact repeats (also the same
+    # instant written in two zones), and a lone time that is just the start of a range already
+    # listed ("19:45" + "19:45-20:45").
+    range_starts = {s for s, e, _ in ranges if e}
+    results, labels = [], []
+    for s, e, label in ranges:
         if (s, e) not in results and not (e is None and s in range_starts):
             results.append((s, e))
-    return tz_label, results
+            labels.append(label)
+    return (labels[0] if labels else dflt_label), results
 
 
 def fmt_12h(dt) -> str:
@@ -239,7 +381,10 @@ def fmt_span(start, end) -> str:
 def format_times(tz_label, times):
     lines = []
     for start, end in times:
-        parts = [f"**{fmt_span(start, end)} {tz_label}**"]
+        name = start.tzname() or ""
+        if not name or name[0] in "+-":  # zones without an abbreviation report "+08"
+            name = tz_label
+        parts = [f"**{fmt_span(start, end)} {name}**"]
         for name, tz in TARGETS:
             ls, le = start.astimezone(tz), end.astimezone(tz) if end else None
             parts.append(f"{name}: {fmt_span(ls, le)} {ls:%Z}")
@@ -260,8 +405,6 @@ DEDUPE_DAYS = 14  # how long to remember content/time-window fingerprints
 MAX_AGE_HOURS = 48
 # A newly added feed records its backlog without posting, except tweets this recent.
 NEW_FEED_RECENT_HOURS = 3
-# Maintenance tweets matching this are cancellations: own title, no ping.
-CANCEL_RE = re.compile(r"cancel|call(ed)? off|취소|중지|中止|キャンセル", re.I)
 
 
 def tweet_key(entry) -> str:
@@ -281,9 +424,10 @@ def content_fingerprint(text: str) -> str:
 
 
 def window_key(cat, times, text=""):
-    """Maintenance with the same start time = same maintenance (catches reminder tweets)."""
-    if cat["key"] != "maintenance" or not times or CANCEL_RE.search(text):
-        return None  # a cancellation shares the start time but is news, not a reminder
+    """Maintenance with the same start time = same maintenance (catches reminder tweets). Plain
+    announcements only: a cancellation/completion/extension shares the start time but is news."""
+    if cat["key"] != "maintenance" or not times or maint_status(cat, text):
+        return None
     return f"maint:{times[0][0].astimezone(ZoneInfo('UTC')):%Y%m%d%H%M}"
 
 
@@ -329,13 +473,30 @@ def save_state(state):
 HANDLE_RE = re.compile(r"(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status", re.I)
 
 
-def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X"):
-    cancelled = cat["key"] == "maintenance" and CANCEL_RE.search(text)
+def quote_block(quote: str, url) -> str:
+    """A quoted tweet as a Discord block quote under the post ("" without one)."""
+    if not quote:
+        return ""
+    if len(quote) > 700:
+        quote = quote[:700].rsplit(" ", 1)[0] + " …"
+    head = f"> ↪ [Quoted post]({url})" if url else "> ↪ Quoted post"
+    body = "\n".join(f"> {line}" if line.strip() else ">" for line in quote.splitlines())
+    return f"\n\n{head}\n{body}"
+
+
+def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X", quote="", quote_url=None):
+    status = maint_status(cat, text)
+    title, color = cat["title"], cat["color"]
+    for key, _, status_title, status_color in MAINT_STATUS:
+        if key == status:
+            title, color = status_title, status_color
+    if len(text) > 3000:
+        text = text[:2999] + "…"
     embed = {
-        "title": "✅ Maintenance cancelled" if cancelled else cat["title"],
+        "title": title,
         "url": entry.get("link"),
-        "description": text[:3500],
-        "color": 0xF1C40F if cancelled else cat["color"],
+        "description": (text + quote_block(quote, quote_url))[:4000],  # Discord's limit is 4096
+        "color": color,
         "footer": {"text": source[:100]},
     }
     # Which account tweeted it, e.g. "@AION2_JP", linked to the profile.
@@ -347,7 +508,7 @@ def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X")
     if times:
         embed["fields"] = [{"name": "🕒 Converted times", "value": format_times(tz_label, times)[:1024]}]
     payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}  # no surprise @everyone
-    if cat["ping"] and not cancelled and ROLE_ID.isdigit():
+    if cat["ping"] and status is None and ROLE_ID.isdigit():  # only plain "servers going down" posts ping
         payload["content"] = f"<@&{ROLE_ID}> maintenance incoming"
         payload["allowed_mentions"] = {"roles": [ROLE_ID]}
     return payload
@@ -498,24 +659,36 @@ def decide(entry, source, state):
     """What to do with one feed entry: ("post", info with a payload) or (skip reason, info).
     Shared by real runs and preview, so a preview shows exactly what would be posted."""
     eid = tweet_key(entry)
-    text = clean(entry.get("summary") or entry.get("title", ""))
-    cat = classify(text)
+    full = TRAILER_RE.sub("", clean(entry.get("summary") or entry.get("title", "")))
+    own_name, own_handle = feed_identity(source)
+    author = HANDLE_RE.search(entry.get("link") or "")
+    if own_handle and author and author.group(1).lower() != own_handle.lower():
+        return "retweet", {"text": full}  # the account reposting someone else's tweet
+    # Judge the tweet by its own words; a quoted tweet is only shown (and used as a fallback).
+    text, quote, quote_url = split_quote(full, own_name)
+    cat = classify(text) or (classify(f"{text}\n{quote}") if quote else None)
     if not cat:
-        return "not important", {"text": text}
+        return "not important", {"text": full}
+    if cat["key"] == "event" and is_promo(text):
+        return "promo", {"text": full}
+    published = entry_time(entry)
     try:
         # Tweets rarely name their zone; label Japanese-account times JST (same UTC+9 as KST).
-        handle = HANDLE_RE.search(entry.get("link") or "")
-        default_tz = "JST" if handle and handle.group(1).upper().endswith("_JP") else None
-        tz_label, times = parse_times(text, entry_time(entry), default_tz)
+        default_tz = "JST" if author and author.group(1).upper().endswith("_JP") else None
+        tz_label, times = parse_times(text, published, default_tz)
+        if not times and quote:  # e.g. a reminder that quotes the original notice
+            tz_label, times = parse_times(quote, published, default_tz)
     except Exception as e:  # odd date text must never block the post itself
         print(f"time parse failed {eid}: {type(e).__name__}: {e}")
         tz_label, times = SOURCE_TZ, []
-    fp = "text:" + content_fingerprint(text)
+    status = maint_status(cat, text)
+    fp = "text:" + content_fingerprint(text + quote)
     wk = window_key(cat, times, text)
     if is_repeat(state, fp, eid) or is_repeat(state, wk, eid):
-        return "duplicate/reminder", {"text": text}
-    payload = build_payload(cat, entry, text, tz_label, times, source)
-    return "post", {"text": text, "cat": cat, "times": times, "fp": fp, "wk": wk, "payload": payload}
+        return "duplicate/reminder", {"text": full}
+    payload = build_payload(cat, entry, text, tz_label, times, source, quote, quote_url)
+    return "post", {"text": full, "cat": cat, "status": status, "times": times,
+                    "fp": fp, "wk": wk, "payload": payload}
 
 
 def preview(state, items):
@@ -584,7 +757,8 @@ def main():
         if info["wk"]:
             state["recent"][info["wk"]] = {"t": now, "id": eid}
         save_state(state)  # save after every post, so a crash can't cause reposts
-        print(f"posted {info['cat']['key']} {eid} ({len(info['times'])} times)")
+        kind = info["cat"]["key"] + (f"/{info['status']}" if info["status"] else "")
+        print(f"posted {kind} {eid} ({len(info['times'])} times)")
     save_state(state)
     if failures:
         sys.exit(f"{failures} feed/post error(s) above; failed posts are retried next run")  # run shows red
