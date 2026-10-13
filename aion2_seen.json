@@ -219,5 +219,16 @@
   "b808a3c5f94a",
   "550ef02bfbd9"
  ],
- "schema": 2
+ "schema": 2,
+ "upcoming": {},
+ "feed_health": {
+  "550ef02bfbd9": {
+   "handle": "AION2_JP",
+   "newest": 1791860640
+  },
+  "b808a3c5f94a": {
+   "handle": "AION2Official",
+   "newest": 1791859740
+  }
+ }
 }
