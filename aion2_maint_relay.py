@@ -15,6 +15,9 @@ Env vars (GitHub Actions secrets, or a chmod 600 env file):
   CATEGORIES           Optional: which to relay (default: maintenance,event,update)
   SOURCE_TZ            Fallback tz if the tweet doesn't say one (default: KST)
   STATE_FILE           Where seen post IDs are stored (default: ./aion2_seen.json)
+  REMINDER_MINUTES     Optional: how long before maintenance the reminder goes out (default: 60)
+  PREVIEW, PREVIEW_COUNT  Optional: print what the newest tweets would post as; post/save nothing
+  LAST_DISPATCH        Set by the workflow on GitHub's scheduled runs (15-minute trigger check)
 
 Deps: pip install feedparser requests
 """
