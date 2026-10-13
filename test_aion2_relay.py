@@ -586,3 +586,11 @@ def test_preview_without_webhook(harness, monkeypatch, capsys):
     monkeypatch.setattr(r, "WEBHOOK", None)
     r.main()
     assert "would post update" in capsys.readouterr().out
+
+
+def test_preview_shows_text_of_skipped_tweets(harness, monkeypatch, capsys):
+    harness.feed.append(at(1, "Fan art Friday!", 1))
+    monkeypatch.setattr(r, "PREVIEW", True)
+    r.main()
+    out = capsys.readouterr().out
+    assert "skip (not important)" in out and 'text: "Fan art Friday!"' in out

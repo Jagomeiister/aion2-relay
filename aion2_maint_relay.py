@@ -41,7 +41,10 @@ ROLE_ID = os.environ.get("DISCORD_ROLE_ID", "").strip()
 ENABLED = {c.strip().lower() for c in os.environ.get("CATEGORIES", "maintenance,event,update").split(",")}
 # PREVIEW=1: print what the newest tweets of each feed would post as. Posts and saves nothing.
 PREVIEW = os.environ.get("PREVIEW", "").strip().lower() in ("1", "true", "yes")
-PREVIEW_PER_FEED = 3
+try:
+    PREVIEW_PER_FEED = max(1, int(float(os.environ.get("PREVIEW_COUNT") or 3)))
+except ValueError:
+    PREVIEW_PER_FEED = 3
 USER_AGENT = "aion2-relay (+https://github.com/Jagomeiister/aion2-relay)"
 
 # Checked in order: first match wins, so maintenance beats event/update.
@@ -492,13 +495,13 @@ def fetch_feeds(state):
 
 
 def decide(entry, source, state):
-    """What to do with one feed entry: ("post", info) or (skip reason, None). Shared by real runs
-    and preview, so a preview shows exactly what would be posted."""
+    """What to do with one feed entry: ("post", info with a payload) or (skip reason, info).
+    Shared by real runs and preview, so a preview shows exactly what would be posted."""
     eid = tweet_key(entry)
     text = clean(entry.get("summary") or entry.get("title", ""))
     cat = classify(text)
     if not cat:
-        return "not important", None
+        return "not important", {"text": text}
     try:
         # Tweets rarely name their zone; label Japanese-account times JST (same UTC+9 as KST).
         handle = HANDLE_RE.search(entry.get("link") or "")
@@ -510,9 +513,9 @@ def decide(entry, source, state):
     fp = "text:" + content_fingerprint(text)
     wk = window_key(cat, times, text)
     if is_repeat(state, fp, eid) or is_repeat(state, wk, eid):
-        return "duplicate/reminder", None
+        return "duplicate/reminder", {"text": text}
     payload = build_payload(cat, entry, text, tz_label, times, source)
-    return "post", {"cat": cat, "times": times, "fp": fp, "wk": wk, "payload": payload}
+    return "post", {"text": text, "cat": cat, "times": times, "fp": fp, "wk": wk, "payload": payload}
 
 
 def preview(state, items):
@@ -524,11 +527,12 @@ def preview(state, items):
             continue
         shown[n] = shown.get(n, 0) + 1
         verdict, info = decide(entry, source, state)
-        what = f"would post {info['cat']['key']}" if info else f"skip ({verdict})"
+        what = f"would post {info['cat']['key']}" if verdict == "post" else f"skip ({verdict})"
         print(f"\n=== feed {n} · {tweet_key(entry)} · {what}")
         print("fields:", ", ".join(sorted(entry.keys())))
         print("html:", html_skeleton(entry.get("summary") or ""))
-        if info:
+        print("text:", redact(json.dumps(info["text"][:1500], ensure_ascii=False)))
+        if verdict == "post":
             deliver(info["payload"])  # prints, doesn't post
 
 
@@ -565,7 +569,7 @@ def main():
             continue
 
         verdict, info = decide(entry, source, state)
-        if not info:
+        if verdict != "post":
             print(f"skipped ({verdict}) {eid}")
             continue
         try:

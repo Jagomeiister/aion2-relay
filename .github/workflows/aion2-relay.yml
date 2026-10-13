@@ -11,6 +11,10 @@ on:
         description: "Preview only: show what the newest tweets would post as. Posts and saves nothing."
         type: boolean
         default: false
+      count:
+        description: "Preview: how many of each feed's newest tweets to show"
+        type: number
+        default: 3
 
 permissions:
   contents: write             # only needed to commit the seen-posts state file
@@ -50,6 +54,7 @@ jobs:
           SOURCE_TZ: KST
           STATE_FILE: aion2_seen.json
           PREVIEW: ${{ inputs.preview && '1' || '' }}
+          PREVIEW_COUNT: ${{ inputs.count }}
         run: python aion2_maint_relay.py
 
       - name: Save seen-posts state
