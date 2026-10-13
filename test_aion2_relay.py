@@ -265,7 +265,7 @@ def test_new_feed_is_baselined_not_flooded(harness, monkeypatch):
     h.feeds[FEED_B].append(entry(11, "Login reward event!", 5))
     r.main()
     assert len(h.sent) == 1
-    assert h.sent[0]["embeds"][0]["footer"]["text"] == f"src {FEED_B[-5:]}"
+    assert h.sent[0]["embeds"][0]["url"].endswith("/status/11")  # feed B's new tweet
     # The state file is public: it must never contain the feed URLs.
     assert "secret" not in h.state.read_text()
 
@@ -720,3 +720,91 @@ def test_status_posts_never_ping(monkeypatch, text, title):
     monkeypatch.setattr(r, "ROLE_ID", "987654321")
     p = r.build_payload(r.classify(text), {"link": ""}, text, "KST", [])
     assert p["embeds"][0]["title"] == title and "content" not in p
+
+
+# --- step E: better-looking posts --------------------------------------------
+
+OEMBED = ('<blockquote class="twitter-tweet"><p lang="en" dir="ltr">Patch notes are live!<br><br>'
+          'Click here <a href="https://t.co/abc">aion2.plaync.com/en-us/board…</a><br><br>'
+          '<a href="https://twitter.com/hashtag/AION2?src=hash">#AION2</a> '
+          '<a href="https://t.co/pic">pic.twitter.com/xyz</a></p>&mdash; AION 2 (@AION2Official) '
+          '<a href="https://twitter.com/AION2Official/status/5">October 9, 2026</a></blockquote>')
+
+
+def test_links_become_clickable_and_clutter_goes():
+    e = feed_entry("https://x.com/AION2Official/status/2108229078675521703", OEMBED)
+    kind, info, _ = verdict_of(e, GL_SOURCE)
+    desc = info["payload"]["embeds"][0]["description"]
+    assert kind == "update"
+    assert desc == "Patch notes are live!\n\nClick here [aion2.plaync.com/en-us/board…](https://t.co/abc)"
+
+
+def test_md_link_escaping():
+    assert r.md_link("a]b [c", "https://x.com/a (b)") == "[a)b (c](https://x.com/a%20%28b%29)"
+
+
+def test_truncate_never_splits_link():
+    text = "x" * 20 + "[label](https://example.com/long)" + "y" * 20
+    out = r.truncate_md(text, 30)
+    assert out == "x" * 20 + "…" and "[label" not in out
+    assert r.truncate_md("short", 30) == "short"
+
+
+@pytest.mark.parametrize("entry,expected", [
+    ({"media_content": [{"url": "https://pbs.twimg.com/media/A.jpg", "medium": "image"}]}, "https://pbs.twimg.com/media/A.jpg"),
+    ({"media_content": [{"url": "https://pbs.twimg.com/media/B?format=jpg&name=large"}]}, "https://pbs.twimg.com/media/B?format=jpg&name=large"),
+    ({"media_thumbnail": [{"url": "https://pbs.twimg.com/media/C.png"}]}, "https://pbs.twimg.com/media/C.png"),
+    ({"enclosures": [{"href": "https://pbs.twimg.com/media/D.jpg", "type": "image/jpeg"}]}, "https://pbs.twimg.com/media/D.jpg"),
+    ({"summary": '<p>hi <img alt="x" src="https://pbs.twimg.com/media/E.jpg"></p>'}, "https://pbs.twimg.com/media/E.jpg"),
+    ({"media_content": [{"url": "http://insecure.example/F.jpg", "medium": "image"}]}, None),
+    ({"media_content": [{"url": "https://rss.app/img/G.jpg", "medium": "image"}]}, None),
+    ({"summary": '<img src="https://abs.twimg.com/emoji/v2/72x72/1f389.png">'}, None),
+    ({"media_content": [{"url": "https://video.twimg.com/H.mp4", "medium": "video"}]}, None),
+    ({}, None),
+])
+def test_entry_image(entry, expected):
+    assert r.entry_image(entry) == expected
+
+
+def test_payload_has_image_timestamp_and_footer():
+    e = feed_entry("https://x.com/AION2_JP/status/2108543188281733255", "Patch notes are live!",
+                   datetime(2026, 10, 9, 13, 0, tzinfo=UTC))
+    e["media_content"] = [{"url": "https://pbs.twimg.com/media/A.jpg", "medium": "image"}]
+    embed = r.decide(e, JP_SOURCE, fresh_state())[1]["payload"]["embeds"][0]
+    assert embed["image"] == {"url": "https://pbs.twimg.com/media/A.jpg"}
+    assert embed["timestamp"] == "2026-10-09T13:00:00+00:00"
+    assert embed["footer"]["text"] == "via X · translated from Japanese"
+    jp = feed_entry("https://x.com/AION2_JP/status/1", "アップデートのお知らせ")
+    assert r.decide(jp, JP_SOURCE, fresh_state())[1]["payload"]["embeds"][0]["footer"]["text"] == "via X"
+
+
+def test_rejected_image_is_retried_without_it(monkeypatch):
+    sent = []
+
+    def fake_post(payload):
+        if any("image" in em for em in payload["embeds"]):
+            raise r.PostError("HTTP 400 bad image", 400)
+        sent.append(payload)
+
+    monkeypatch.setattr(r, "post", fake_post)
+    r.deliver({"embeds": [{"title": "t", "image": {"url": "https://pbs.twimg.com/media/bad.jpg"}}]})
+    assert sent == [{"embeds": [{"title": "t"}]}]
+
+
+def test_other_400s_are_not_retried(monkeypatch):
+    def fake_post(payload):
+        raise r.PostError("HTTP 400", 400)
+    monkeypatch.setattr(r, "post", fake_post)
+    with pytest.raises(r.PostError):
+        r.deliver({"embeds": [{"title": "no image"}]})
+
+
+@pytest.mark.parametrize("raw", [
+    "", "<a href='x'>", "<a>no href</a>", "<img>", "<p><a href=\"https://t.co/1\"></a></p>",
+    "<<<>>>", "&mdash;&mdash;", "<blockquote><p>Patch notes <a href='javascript:alert(1)'>click</a></p></blockquote>",
+])
+def test_odd_html_never_crashes(raw):
+    e = r.feedparser.FeedParserDict(link="https://x.com/AION2Official/status/9", summary=raw)
+    verdict, info = r.decide(e, GL_SOURCE, fresh_state())
+    if verdict == "post":
+        assert "javascript:" not in info["payload"]["embeds"][0]["description"]

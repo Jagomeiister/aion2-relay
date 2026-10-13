@@ -473,32 +473,130 @@ def save_state(state):
 HANDLE_RE = re.compile(r"(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status", re.I)
 
 
+ANCHOR_RE = re.compile(r"""<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""", re.I | re.S)
+PIC_LINK_RE = re.compile(r"(?:https?://)?pic\.(?:twitter|x)\.com/", re.I)
+RSS_APP_HOST_RE = re.compile(r"https?://(?:[\w-]+\.)*rss\.app\b", re.I)
+MD_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*\)")
+TRAILING_TAGS_RE = re.compile(r"(?:\s*#[^\s#]+)+\s*$")
+VIDEO_LINE_RE = re.compile(r"^[ \t]*Video[ \t]*$", re.M)  # rss.app's placeholder for an embedded video
+
+
+def anchors(raw: str):
+    """[(label, href)] for the links in an entry's HTML, labels exactly as they appear in clean() text."""
+    out = []
+    for href, inner in ANCHOR_RE.findall(raw or ""):
+        label = clean(inner)
+        if label:
+            out.append((label, html.unescape(href).strip()))
+    return out
+
+
+def md_link(label: str, href: str) -> str:
+    label = re.sub(r"^https?://", "", label).replace("[", "(").replace("]", ")")[:200]
+    for ch, code in ((" ", "%20"), ("(", "%28"), (")", "%29"), ("<", "%3C"), (">", "%3E")):
+        href = href.replace(ch, code)
+    return f"[{label}]({href})"
+
+
+def linkify(text: str, links) -> str:
+    """Make a tweet's links clickable for Discord: "aion2.plaync.com/…" → [label](url); picture
+    links are dropped (the image is attached); hashtags, mentions and non-web links stay as text."""
+    pos = 0
+    for label, href in links:
+        i = text.find(label, pos)
+        if i < 0:
+            continue
+        if PIC_LINK_RE.match(label):
+            new = ""
+        elif label[0] in "#@$" or not href.lower().startswith(("http://", "https://")) or RSS_APP_HOST_RE.match(href):
+            pos = i + len(label)
+            continue
+        else:
+            new = md_link(label, href)
+        text = text[:i] + new + text[i + len(label):]
+        pos = i + len(new)
+    return text
+
+
+def tidy(text: str) -> str:
+    """Post-ready text: no "Video" placeholder lines or trailing hashtags, at most one blank line."""
+    text = VIDEO_LINE_RE.sub("", text)
+    without_tags = TRAILING_TAGS_RE.sub("", text)
+    text = without_tags if without_tags.strip() else text
+    return re.sub(r"\n[ \t]*(?:\n[ \t]*)+\n", "\n\n", text).strip()
+
+
+def truncate_md(text: str, limit: int) -> str:
+    """Shorten to limit characters with "…", never cutting a [label](url) link in half."""
+    if len(text) <= limit:
+        return text
+    cut = limit - 1
+    for m in MD_LINK_RE.finditer(text):
+        if m.start() < cut < m.end():
+            cut = m.start()
+            break
+    return text[:cut].rstrip() + "…"
+
+
+IMAGE_URL_RE = re.compile(r"\.(?:jpe?g|png|webp|gif)(?:$|\?)|[?&]format=(?:jpe?g|png|webp)|pbs\.twimg\.com/media/", re.I)
+
+
+def usable_image(url) -> bool:
+    url = (url or "").strip()
+    return (url.startswith("https://") and len(url) <= 2000 and not RSS_APP_HOST_RE.match(url)
+            and not re.search(r"/emoji/|/profile_images/|\.svg(?:$|\?)", url, re.I))
+
+
+def entry_image(entry):
+    """The tweet's first picture: rss.app's media_content, then thumbnails, image enclosures,
+    then any <img> in the HTML. None if there's no usable https image."""
+    candidates = []
+    for m in entry.get("media_content") or []:
+        kind = f"{m.get('medium', '')} {m.get('type', '')}"
+        if "image" in kind or IMAGE_URL_RE.search(m.get("url") or ""):
+            candidates.append(m.get("url"))
+    candidates += [m.get("url") for m in entry.get("media_thumbnail") or []]
+    candidates += [e.get("href") for e in entry.get("enclosures") or [] if str(e.get("type", "")).startswith("image/")]
+    for part in [entry.get("summary") or ""] + [c.get("value") or "" for c in entry.get("content") or []]:
+        candidates += re.findall(r"""<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']""", part, re.I)
+    return next((u for u in (html.unescape(c or "").strip() for c in candidates) if usable_image(u)), None)
+
+
 def quote_block(quote: str, url) -> str:
     """A quoted tweet as a Discord block quote under the post ("" without one)."""
     if not quote:
         return ""
-    if len(quote) > 700:
-        quote = quote[:700].rsplit(" ", 1)[0] + " …"
+    quote = truncate_md(quote, 700)
     head = f"> ↪ [Quoted post]({url})" if url else "> ↪ Quoted post"
     body = "\n".join(f"> {line}" if line.strip() else ">" for line in quote.splitlines())
     return f"\n\n{head}\n{body}"
 
 
-def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X", quote="", quote_url=None):
+def build_payload(cat, entry, text, tz_label, times, source="AION 2 official X", quote="", quote_url=None,
+                  display=None, display_quote=None):
+    """text/quote are what was classified; display/display_quote (with links) are what's shown."""
     status = maint_status(cat, text)
     title, color = cat["title"], cat["color"]
     for key, _, status_title, status_color in MAINT_STATUS:
         if key == status:
             title, color = status_title, status_color
-    if len(text) > 3000:
-        text = text[:2999] + "…"
+    body = truncate_md(display if display is not None else text, 3000)
+    shown_quote = display_quote if display_quote is not None else quote
+    handle = (HANDLE_RE.search(entry.get("link") or "") or [None, ""])[1]
+    translated = handle.upper().endswith("_JP") and not re.search(r"[぀-ヿ]", text)
     embed = {
         "title": title,
         "url": entry.get("link"),
-        "description": (text + quote_block(quote, quote_url))[:4000],  # Discord's limit is 4096
+        "description": (body + quote_block(shown_quote, quote_url))[:4000],  # Discord's limit is 4096
         "color": color,
-        "footer": {"text": source[:100]},
+        "footer": {"text": "via X" + (" · translated from Japanese" if translated else "")},
     }
+    published = entry_time(entry)
+    if published:
+        embed["timestamp"] = published.isoformat()  # Discord shows it in each reader's own time
+    image = entry_image(entry)
+    if image:
+        embed["image"] = {"url": image}
     # Which account tweeted it, e.g. "@AION2_JP", linked to the profile.
     m = HANDLE_RE.search(entry.get("link") or "")
     if m:
@@ -571,7 +669,15 @@ def deliver(payload):
     if PREVIEW:
         print(redact(json.dumps(payload, ensure_ascii=False, indent=1)))
         return
-    post(payload)
+    try:
+        post(payload)
+    except PostError as e:
+        embeds = payload.get("embeds") or []
+        if e.status != 400 or not any("image" in em for em in embeds):
+            raise
+        for em in embeds:  # Discord rejected the post, most likely the image URL: send the text alone
+            em.pop("image", None)
+        post(payload)
 
 
 RSS_APP_URL_RE = re.compile(r"https?://(?:[\w-]+\.)*rss\.app\b[^\s\"'<>)\]]*", re.I)
@@ -659,7 +765,8 @@ def decide(entry, source, state):
     """What to do with one feed entry: ("post", info with a payload) or (skip reason, info).
     Shared by real runs and preview, so a preview shows exactly what would be posted."""
     eid = tweet_key(entry)
-    full = TRAILER_RE.sub("", clean(entry.get("summary") or entry.get("title", "")))
+    raw = entry.get("summary") or entry.get("title", "")
+    full = TRAILER_RE.sub("", clean(raw))
     own_name, own_handle = feed_identity(source)
     author = HANDLE_RE.search(entry.get("link") or "")
     if own_handle and author and author.group(1).lower() != own_handle.lower():
@@ -686,7 +793,10 @@ def decide(entry, source, state):
     wk = window_key(cat, times, text)
     if is_repeat(state, fp, eid) or is_repeat(state, wk, eid):
         return "duplicate/reminder", {"text": full}
-    payload = build_payload(cat, entry, text, tz_label, times, source, quote, quote_url)
+    links = anchors(raw)
+    display = tidy(linkify(text, links))
+    display_quote = tidy(linkify(quote, links)) if quote else ""
+    payload = build_payload(cat, entry, text, tz_label, times, source, quote, quote_url, display, display_quote)
     return "post", {"text": full, "cat": cat, "status": status, "times": times,
                     "fp": fp, "wk": wk, "payload": payload}
 
