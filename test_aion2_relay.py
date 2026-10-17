@@ -163,8 +163,15 @@ def harness(tmp_path, monkeypatch):
     clock = {"now": None}  # None = real time
     monkeypatch.setattr(r, "now_ts", lambda: clock["now"] if clock["now"] is not None else time.time())
     monkeypatch.delenv("LAST_DISPATCH", raising=False)
+    x, x_calls = {}, []  # handle -> newest original post on X (missing = X can't tell); call log
+
+    def fake_latest(handle):
+        x_calls.append(handle)
+        return x.get(handle)
+
+    monkeypatch.setattr(r, "account_latest", fake_latest)
     return SimpleNamespace(state=state, sent=sent, feed=feed, fail=fail, feeds=feeds,
-                           problems=problems, clock=clock, titles=titles)
+                           problems=problems, clock=clock, titles=titles, x=x, x_calls=x_calls)
 
 
 @pytest.fixture(autouse=True)
@@ -709,6 +716,13 @@ def test_short_zone_names_need_capitals():
     ("Maintenance has been completed. Servers are now open!", "complete"),
     ("Maintenance will end early, at 15:00 KST", "early"),
     ("Today's maintenance is cancelled", "cancelled"),
+    # rss.app's English for 「作業が完了しました為、19:30にサーバーをオープンいたしました」 (10-14)
+    ("The regular maintenance carried out on October 14th (Wednesday) was completed as scheduled, "
+     "and the server was opened at 19:30. You can now play the game as usual.", "complete"),
+    ("Maintenance 10/9: the servers were opened at 17:00 KST.", "complete"),
+    ("Maintenance notice: when the work was completed, we opened the servers.", "complete"),  # past after "when"
+    ("Maintenance is expected to be completed as scheduled at 15:00 KST", None),
+    ("Maintenance 10/20 14:00 KST. You can play as usual until 13:30.", None),
 ])
 def test_maintenance_status(text, status):
     assert r.maint_status(r.classify(text), text) == status
@@ -1099,3 +1113,160 @@ def test_preview_shows_due_alerts_without_saving(harness, monkeypatch, capsys):
     r.main()
     assert "hasn't loaded for over an hour" in capsys.readouterr().out
     assert alerts(h) == [] and h.state.read_bytes() == before
+
+
+# --- stale feeds: checked against X before warning ----------------------------
+
+def x_result(tid, ts, author="AION2_JP", **extra):
+    return {"id": str(tid), "created_timestamp": ts, "author": {"screen_name": author}, **extra}
+
+
+def test_account_latest_is_the_newest_original_post(monkeypatch):
+    results = [
+        x_result(1, 100),                                                        # pinned, old
+        x_result(2, 900, author="fan", reposted_by={"screen_name": "AION2_JP"}),  # repost: the fan's time
+        x_result(3, 800, replying_to={"screen_name": "AION2_JP"}),               # self-reply (rss.app omits)
+        x_result(4, 700, quote={"id": "9"}),                                     # quote tweet: an original
+        x_result(5, 600),
+    ]
+    calls = scripted(monkeypatch, "get", Resp(200, json_data={"code": 200, "results": results}))
+    assert r.account_latest("AION2_JP") == 700
+    args, kwargs = calls[0]
+    assert args[0] == "https://api.fxtwitter.com/2/profile/AION2_JP/statuses"
+    assert kwargs["timeout"] == (5, 15) and "aion2-relay" in kwargs["headers"]["User-Agent"]
+
+
+@pytest.mark.parametrize("outcome", [
+    requests.ConnectionError("down"), requests.Timeout("slow"),
+    Resp(404, json_data={"code": 404, "results": []}), Resp(500), Resp(200),  # Resp(200): not JSON
+    Resp(200, json_data={"results": []}),
+    Resp(200, json_data={"results": [x_result(1, 5, replying_to={"screen_name": "AION2_JP"}),
+                                     x_result(2, 6, reposted_by={"screen_name": "AION2_JP"})]}),
+    Resp(200, json_data=[1, 2]), Resp(200, json_data={"results": [None]}),
+])
+def test_account_latest_none_when_x_cannot_tell(monkeypatch, outcome):
+    scripted(monkeypatch, "get", outcome)
+    assert r.account_latest("AION2_JP") is None
+
+
+def test_x_check_due_four_windows_a_day():
+    assert r.x_check_due(T0) and r.x_check_due(T0 + 899) and r.x_check_due(T0 + 6 * 3600)
+    assert not r.x_check_due(T0 + 900) and not r.x_check_due(T0 + 3600)
+
+
+def gl_feed(h):
+    h.titles[FEED_A] = GL_SOURCE  # feed A is @AION2Official's (tweet() links are its posts)
+
+
+def test_x_agrees_quiet_account_is_not_stale(harness):
+    h = harness
+    gl_feed(h)
+    h.feed.append(tweet(1, "hi", T0))
+    h.x["AION2Official"] = T0 + 23  # X's newest original post is the feed's (rss.app drops the seconds)
+    run_at(h, T0 + 60)
+    after_first = h.state.read_bytes()
+    for k in range(1, 73):          # every 3 h for 9 days
+        run_at(h, T0 + k * 3 * 3600)
+    assert alerts(h) == [] and h.state.read_bytes() == after_first
+    # X is asked only in the 6-hourly windows, and only once the feed's newest post is a day old
+    assert h.x_calls == ["AION2Official"] * len([k for k in range(1, 73) if k % 2 == 0 and k * 3 > 24])
+
+
+def test_missed_post_alerts_once_then_resets(harness):
+    h = harness
+    gl_feed(h)
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    h.x["AION2Official"] = T0 + 30 * 3600  # Wed 21 Oct 06:00 UTC: a post the feed never got
+    run_at(h, T0 + 33 * 3600)              # 09:00 UTC: not a check window
+    assert h.x_calls == [] and alerts(h) == []
+    run_at(h, T0 + 36 * 3600)              # 12:00 UTC: checks X
+    assert alerts(h) == ["⚠️ Feed 1 (@AION2Official): @AION2Official posted at Wed 21 Oct 4:00 pm AEST "
+                         "but the rss.app feed hasn't picked it up — check rss.app"]
+    run_at(h, T0 + 42 * 3600)
+    assert len(alerts(h)) == 1             # once only
+    h.feed.append(tweet(2, "hi again", T0 + 30 * 3600))  # rss.app catches up
+    run_at(h, T0 + 43 * 3600)
+    assert "stale_alerted" not in json.loads(h.state.read_text())["feed_health"][r.feed_key(FEED_A)]
+
+
+def test_recent_x_post_gets_the_rss_app_lag(harness):
+    h = harness
+    gl_feed(h)
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    h.x["AION2Official"] = T0 + 35 * 3600  # posted an hour before the next check window
+    run_at(h, T0 + 36 * 3600)
+    assert alerts(h) == []                 # rss.app gets 2 h to pick it up
+    run_at(h, T0 + 42 * 3600)
+    assert len(alerts(h)) == 1
+
+
+def test_x_post_within_lag_of_the_feed_is_the_same_post(harness):
+    h = harness
+    gl_feed(h)
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    h.x["AION2Official"] = T0 + 90 * 60
+    for days in range(1, 10):
+        run_at(h, T0 + days * 86400)
+    assert alerts(h) == []
+
+
+def test_x_unavailable_falls_back_to_7_days(harness, monkeypatch):
+    h = harness
+    gl_feed(h)
+    monkeypatch.setattr(r, "STALE_DAYS", 7)
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    run_at(h, T0 + 6 * 86400)              # X can't tell; only 6 days quiet
+    run_at(h, T0 + 7 * 86400 + 6 * 3600)
+    assert alerts(h) == ["⚠️ Feed 1 (@AION2Official): no new tweets for 7 days — check the rss.app feed is still updating"]
+    assert h.x_calls == ["AION2Official", "AION2Official"]
+
+
+def test_fan_reposts_do_not_make_a_feed_look_current(harness):
+    h = harness
+    gl_feed(h)
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    h.feed.append(r.feedparser.FeedParserDict(
+        link="https://x.com/somefan/status/77", summary="my screenshot",
+        published_parsed=datetime.fromtimestamp(T0 + 40 * 3600, UTC).timetuple()))
+    h.x["AION2Official"] = T0 + 30 * 3600
+    run_at(h, T0 + 42 * 3600)
+    assert len(alerts(h)) == 1
+
+
+def test_preview_asks_x_any_time_and_saves_nothing(harness, monkeypatch, capsys):
+    h = harness
+    gl_feed(h)
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    h.x["AION2Official"] = T0 + 30 * 3600
+    run_at(h, T0 + 33 * 3600)              # a normal run outside the check windows: X not asked
+    assert h.x_calls == []
+    before = h.state.read_bytes()
+    monkeypatch.setattr(r, "PREVIEW", True)
+    capsys.readouterr()
+    run_at(h, T0 + 33 * 3600)
+    assert h.x_calls == ["AION2Official"] and "hasn't picked it up" in capsys.readouterr().out
+    assert alerts(h) == [] and h.state.read_bytes() == before
+
+
+def test_old_newest_field_is_replaced_once(harness):
+    h = harness
+    gl_feed(h)
+    h.feed.append(tweet(1, "hi", T0))
+    run_at(h, T0 + 60)
+    state, key = json.loads(h.state.read_text()), r.feed_key(FEED_A)
+    state["feed_health"][key] = {"handle": "AION2Official", "newest": T0, "stale_alerted": T0 + 3 * 86400}
+    h.state.write_text(json.dumps(state))  # state as written by the previous version
+    h.x["AION2Official"] = T0 + 23
+    run_at(h, T0 + 4 * 86400)              # a check window: X says the account is just quiet
+    assert json.loads(h.state.read_text())["feed_health"][key] == {"handle": "AION2Official", "newest_own": T0}
+    assert alerts(h) == []
+
+
+def test_festivities_are_an_event():
+    assert r.classify("Join the Halloween festivities in Atreia!")["key"] == "event"

@@ -790,5 +790,23 @@
   "text": "📢Pre-registration now available\n\nWe have started accepting pre-registration for AION2.\n\nAt the same time, a new special website has also opened ✨\nWe will continue to provide information regarding AION2 in the future.\n\nFor details on pre-registration, please check the special website 🔗\n aion2.ncsoft.jp\n\n #AION2  #Aion2— AION2 (@AION2_JP)Jun 6, 2026",
   "expected": "not important",
   "brisbane": []
+ },
+ {
+  "id": "2110317692465135631",
+  "source": "AION2 (@AION2_JP) / Twitter",
+  "link": "https://x.com/AION2_JP/status/2110317692465135631",
+  "text": "📢Notice of end of regular maintenance on October 14th\n\nThe regular maintenance carried out on October 14th (Wednesday) was completed as scheduled, and the server was opened at 19:30.\n\n■Server open date and time\nWednesday, October 14, 2026 19:30\n\nYou can now play the game as usual.\nThank you very much for your understanding and cooperation regarding maintenance.\n\n #AION2  #Aion2AION2 (@AION2_JP)📢Regular maintenance notice\n\nWe will be conducting regular maintenance on the following dates.\n\n📅October 14th (Wednesday) 15:30 - 19:30 (4 hours 00 minutes)\n🎮Target: All servers\n\nYou will not be able to play the game during maintenance.\n\nPlease check the announcement for details.\n\n▼Click here for details\n aion2.plaync.com/ja-jp/board…\n\n #AION2  #Aion2— https://x.com/AION2_JP/status/2109962370873225485",
+  "expected": "maintenance/complete",
+  "brisbane": [
+   "Wed 14 Oct 8:30 pm"
+  ]
+ },
+ {
+  "id": "2111220390051909820",
+  "source": "AION 2 (@AION2Official) / Twitter",
+  "link": "https://x.com/AION2Official/status/2111220390051909820",
+  "text": "Enjoy new Halloween treats and mischief in Atreia today!🎃 Watch as Community Broadcaster, Stella, breaks down the Halloween update in AION 2. Unlock brand-new spooky weapon skins, pets, outfits, and many more!👻\n\nJoin the Halloween festivities in Atreia and play in AION 2 now!\n🪽 s.g.nc.com/s/izmTW\n\n #AION2  #AION2Global  #MMORPG \nVideo",
+  "expected": "event",
+  "brisbane": []
  }
 ]

@@ -12,7 +12,13 @@ Discord channel, with times converted to Brisbane and New Zealand time. Runs on 
 | ⏰ Maintenance starts in ~N min | 45–60 min before each announced maintenance (pings the alert role) |
 | 🎉 Event (green) | events, campaigns, giveaways, login rewards, free items, livestreams |
 | 📜 Game update (blue) | patch notes, updates, new seasons, new servers, server transfers |
-| ⚠️ Bot-health notes (plain text) | a feed down for an hour, a feed with no new tweets for 3 days, or the 15-minute trigger stopped |
+| ⚠️ Bot-health notes (plain text) | a feed down for an hour; a feed that missed a post (see below); the 15-minute trigger stopped |
+
+A quiet account isn't a problem, so a feed is only flagged as stale when the account posted
+something the feed never picked up. When a feed's newest post by its own account is over a day
+old, the bot checks the account's public X profile (via the free fxtwitter API, at 00/06/12/18 UTC)
+and warns if there's a newer original post (not a reply or repost) that rss.app hasn't caught up
+on within 2 hours. If X can't be reached, it falls back to warning after 7 days without new posts.
 
 Skipped: chatter, fan posts the accounts retweet, Japan-only promotions (prize draws, shop/café
 tie-ins), duplicates and reminder tweets for a maintenance already posted, tweets over 48 hours old.

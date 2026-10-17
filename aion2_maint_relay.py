@@ -72,7 +72,7 @@ CATEGORIES = [
     {
         "key": "event",
         "pattern": re.compile(
-            r"\bevents?\b|festival|celebrat|campaign|login reward|log-?in bonus|attendance|double (xp|exp|drop)|"
+            r"\bevents?\b|festival|festivit(?:y|ies)|celebrat|campaign|login reward|log-?in bonus|attendance|double (xp|exp|drop)|"
             r"limited[- ]time|giveaway|giv(?:e|es|ing) away|\bgifts?\b|livestream|live stream|coupon|redeem|"
             r"loot drop|\brewards?\b|present items?|"
             # "FREE OUTFIT", "free pet"; not "first move is free" (a transfer) or "Play on Steam for free" (an ad)
@@ -144,7 +144,11 @@ def is_promo(text: str) -> bool:
 CANCEL_RE = re.compile(r"cancel|call(ed)? off|취소|중지|中止|キャンセル", re.I)
 COMPLETE_RE = re.compile(
     r"\bhas (?:been )?(?:completed|finished|ended)\b|\b(?:is|are) now (?:complete|over|open|online|back)\b|"
-    r"\bservers? (?:is|are|has|have) (?:now )?(?:re)?opened?\b|"
+    r"\bservers? (?:is|are|has|have|has been|have been) (?:now )?(?:re)?opened?\b|"
+    r"\b(?:re)?opened the servers?\b|\bcan now play (?:the game )?(?:as usual|normally)\b|"
+    # Past tense is a fact even after "when/after" ("...the server was opened at 19:30"); see says().
+    # No bare "completed as scheduled": "is expected to be completed as scheduled" is an early-end notice.
+    r"(?P<past>\b(?:was|were) (?:successfully )?(?:completed|finished)\b|\bservers? (?:was |were )?(?:re)?opened\b)|"
     r"終了しました|完了しました|終了いたしました|完了いたしました|종료되었습니다|완료되었습니다", re.I)
 EARLY_RE = re.compile(
     r"\bearly end\b|\bend(?:s|ed|ing)? early\b|\bearlier than (?:planned|scheduled|announced|originally)|"
@@ -166,8 +170,10 @@ CONDITIONAL_RE = re.compile(r"\b(?:once|after|when|until|before|if)\b[^.!?\n]{0,
 
 
 def says(rx, text: str) -> bool:
-    """rx matches somewhere that isn't inside a "once/after/when ..." clause."""
-    return any(not CONDITIONAL_RE.search(text[max(0, m.start() - 40):m.start()]) for m in rx.finditer(text))
+    """rx matches somewhere that isn't inside a "once/after/when ..." clause. A past-tense match
+    (the pattern's "past" group) counts even there: "...after the work was completed" is a fact."""
+    return any(m.groupdict().get("past") or not CONDITIONAL_RE.search(text[max(0, m.start() - 40):m.start()])
+               for m in rx.finditer(text))
 
 
 def maint_status(cat, text: str):
@@ -532,6 +538,12 @@ def save_state(state):
 HANDLE_RE = re.compile(r"(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status", re.I)
 
 
+def is_repost(entry, own_handle: str) -> bool:
+    """The feed's account reposting someone else's tweet: the entry's link names another author."""
+    author = HANDLE_RE.search(entry.get("link") or "")
+    return bool(own_handle and author and author.group(1).lower() != own_handle.lower())
+
+
 ANCHOR_RE = re.compile(r"""<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""", re.I | re.S)
 PIC_LINK_RE = re.compile(r"(?:https?://)?pic\.(?:twitter|x)\.com/", re.I)
 RSS_APP_HOST_RE = re.compile(r"https?://(?:[\w-]+\.)*rss\.app\b", re.I)
@@ -812,9 +824,11 @@ def fetch_feeds(state):
             print(f"feed {n} is new: recording its {len(feed.entries)} existing posts, nothing posted")
         source = feed.feed.get("title") or "AION 2 official X"
         items += [(e, source, is_new, n) for e in feed.entries]
-        dated = [t for t in map(entry_time, feed.entries) if t]
-        statuses.append({"n": n, "key": key, "ok": True, "newest": max(dated) if dated else None,
-                         "handle": feed_identity(source)[1]})
+        handle = feed_identity(source)[1]
+        # The account's own posts only: a fan repost appearing doesn't mean the feed is current.
+        own = [t for t in (entry_time(e) for e in feed.entries if not is_repost(e, handle)) if t]
+        statuses.append({"n": n, "key": key, "ok": True, "newest_own": max(own) if own else None,
+                         "handle": handle})
     # Feeds aren't reliably newest-first, so sort by date (undated last) to post in order.
     far_future = datetime.max.replace(tzinfo=ZoneInfo("UTC"))
     items.sort(key=lambda it: entry_time(it[0]) or far_future)
@@ -908,8 +922,16 @@ def send_reminders(state, now) -> int:
 
 
 FEED_DOWN_MINUTES = 60   # a feed failing this long gets one alert
-STALE_DAYS = 3           # a feed with no new tweets this long gets one warning
 TRIGGER_STALE_MINUTES = 60
+# A quiet feed is only a problem if the account posted something the feed missed. When a feed's
+# newest post by its own account is over STALE_CHECK_HOURS old, the account's public X profile is
+# checked (allowing rss.app RSS_LAG_HOURS to catch up). If X can't tell, warn after STALE_DAYS.
+STALE_CHECK_HOURS = 24
+RSS_LAG_HOURS = 2
+STALE_DAYS = 7
+X_CHECK_EVERY_HOURS = 6  # X is asked only by runs starting in the first 15 min of 00/06/12/18 UTC
+X_PROFILE_URL = "https://api.fxtwitter.com/2/profile/{}/statuses"  # free public API, no key
+BRISBANE = dict(TARGETS)["Brisbane"]
 
 
 def notify(text: str) -> bool:
@@ -922,11 +944,63 @@ def notify(text: str) -> bool:
     return True
 
 
+def account_latest(handle: str):
+    """Unix time of the account's newest original post on X (not a reply or repost), from the
+    fxtwitter API; None if that can't be told. Logs the handle only (it's public)."""
+    try:
+        r = requests.get(X_PROFILE_URL.format(handle), timeout=(5, 15), headers={"User-Agent": USER_AGENT})
+        if r.status_code != 200:
+            print(f"X check @{handle} unavailable (HTTP {r.status_code})")
+            return None
+        results = r.json().get("results") or []
+        times = [int(t["created_timestamp"]) for t in results
+                 if isinstance(t, dict) and not t.get("replying_to") and not t.get("reposted_by")
+                 and str((t.get("author") or {}).get("screen_name", "")).lower() == handle.lower()
+                 and isinstance(t.get("created_timestamp"), (int, float))]
+    except Exception as e:  # network, bad JSON, unexpected shape: X just can't tell this time
+        print(f"X check @{handle} unavailable ({type(e).__name__})")
+        return None
+    if not times:
+        print(f"X check @{handle} unavailable (no original posts listed)")
+        return None
+    latest = max(times)  # results are ordered by repost time and a pinned post comes first
+    print(f"X check @{handle}: newest original post {datetime.fromtimestamp(latest, timezone.utc):%Y-%m-%d %H:%M} UTC")
+    return latest
+
+
+def x_check_due(now) -> bool:
+    """Ask X only on runs starting in the first 15 minutes of every X_CHECK_EVERY_HOURS (00, 06, 12
+    and 18 UTC). Stateless, so checking never writes state (which would commit on every check)."""
+    return now % (X_CHECK_EVERY_HOURS * 3600) < 15 * 60
+
+
+def stale_alert(rec, who, now, due):
+    """The stale-feed warning to post for this feed now, or None."""
+    own, handle, lag = rec.get("newest_own"), rec.get("handle"), RSS_LAG_HOURS * 3600
+    if not own or rec.get("stale_alerted") or now - own <= STALE_CHECK_HOURS * 3600:
+        return None
+    if handle:
+        if not due:
+            return None
+        latest = account_latest(handle)
+        if latest is not None:
+            if latest - own > lag and now - latest > lag:
+                t = datetime.fromtimestamp(latest, BRISBANE)
+                return (f"⚠️ {who}: @{handle} posted at {fmt_12h(t)} {t:%Z} but the rss.app feed hasn't "
+                        "picked it up — check rss.app")
+            return None  # the account has just been quiet
+    if now - own > STALE_DAYS * 86400:  # X can't tell (or no handle): fall back to time alone
+        return f"⚠️ {who}: no new tweets for {int((now - own) // 86400)} days — check the rss.app feed is still updating"
+    return None
+
+
 def check_feed_health(state, statuses, now) -> int:
     """Alert once when a feed has been down FEED_DOWN_MINUTES (and once when it's back), and once
-    when a feed has had no new tweets for STALE_DAYS. State only changes on those transitions, so a
-    long outage doesn't make a commit every run. Returns the number of failed alert posts."""
+    when a feed seems to have stopped picking up posts (see stale_alert). State only changes on
+    those transitions, so an outage or a quiet account doesn't commit every run. Returns the number
+    of failed alert posts."""
     health, failures = state.setdefault("feed_health", {}), 0
+    due = PREVIEW or x_check_due(now)  # a preview always asks X, to show what the check would say
     for st in statuses:
         rec = health.setdefault(st["key"], {})
         who = f"Feed {st['n']}" + (f" (@{rec['handle']})" if rec.get("handle") else "")
@@ -950,13 +1024,14 @@ def check_feed_health(state, statuses, now) -> int:
                     continue
             for k in ("fail_since", "alerted", "problem"):
                 rec.pop(k, None)
-        newest = int(st["newest"].timestamp()) if st.get("newest") else None
-        if newest and newest > rec.get("newest", 0):
-            rec["newest"] = newest
+        rec.pop("newest", None)  # older state: newest of any entry; now newest_own (the account's own)
+        newest = int(st["newest_own"].timestamp()) if st.get("newest_own") else None
+        if newest and newest > rec.get("newest_own", 0):
+            rec["newest_own"] = newest
             rec.pop("stale_alerted", None)
-        if rec.get("newest") and now - rec["newest"] > STALE_DAYS * 86400 and not rec.get("stale_alerted"):
-            days = int((now - rec["newest"]) // 86400)
-            if notify(f"⚠️ {who}: no new tweets for {days} days — check the rss.app feed is still updating"):
+        message = stale_alert(rec, who, now, due)
+        if message:
+            if notify(message):
                 rec["stale_alerted"] = int(now)
             else:
                 failures += 1
@@ -997,8 +1072,8 @@ def decide(entry, source, state):
     full = TRAILER_RE.sub("", clean(raw))
     own_name, own_handle = feed_identity(source)
     author = HANDLE_RE.search(entry.get("link") or "")
-    if own_handle and author and author.group(1).lower() != own_handle.lower():
-        return "retweet", {"text": full}  # the account reposting someone else's tweet
+    if is_repost(entry, own_handle):
+        return "retweet", {"text": full}
     # Judge the tweet by its own words; a quoted tweet is only shown (and used as a fallback).
     text, quote, quote_url = split_quote(full, own_name)
     cat = classify(text) or (classify(f"{text}\n{quote}") if quote else None)
