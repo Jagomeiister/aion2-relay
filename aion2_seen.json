@@ -280,7 +280,8 @@
  "feed_health": {
   "550ef02bfbd9": {
    "handle": "AION2_JP",
-   "newest": 1791974400
+   "newest": 1791974400,
+   "stale_alerted": 1792233925
   },
   "b808a3c5f94a": {
    "handle": "AION2Official",
