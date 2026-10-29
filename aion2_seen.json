@@ -277,22 +277,7 @@
   "550ef02bfbd9"
  ],
  "schema": 2,
- "upcoming": {
-  "maint:202610280630": {
-   "start": 1793169000,
-   "tz": "JST",
-   "id": "2115036236163481727",
-   "handle": "AION2_JP",
-   "ranges": [
-    [
-     1793169000,
-     1793185200,
-     null
-    ]
-   ],
-   "reminded": 1793165436
-  }
- },
+ "upcoming": {},
  "feed_health": {
   "550ef02bfbd9": {
    "handle": "AION2_JP",
