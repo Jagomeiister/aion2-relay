@@ -310,5 +310,7 @@
    "newest_own": 1793998020
   }
  },
- "trigger_health": {}
+ "trigger_health": {
+  "alerted": 1794064218
+ }
 }
