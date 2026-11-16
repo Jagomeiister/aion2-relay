@@ -339,13 +339,11 @@
  "feed_health": {
   "550ef02bfbd9": {
    "handle": "AION2_JP",
-   "newest_own": 1794427200,
-   "fail_since": 1794847614
+   "newest_own": 1794427200
   },
   "b808a3c5f94a": {
    "handle": "AION2Official",
-   "newest_own": 1794751200,
-   "fail_since": 1794846687
+   "newest_own": 1794751200
   }
  },
  "trigger_health": {}
