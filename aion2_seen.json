@@ -352,20 +352,6 @@
  ],
  "schema": 2,
  "upcoming": {
-  "maint:202611171800": {
-   "start": 1794938400,
-   "tz": "PT",
-   "id": "2122434163152166996",
-   "handle": "AION2Official",
-   "ranges": [
-    [
-     1794938400,
-     null,
-     null
-    ]
-   ],
-   "reminded": 1794934850
-  },
   "maint:202611180630": {
    "start": 1794983400,
    "tz": "JST",
